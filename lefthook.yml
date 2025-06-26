@@ -1,0 +1,18 @@
+skip_output:
+  - meta
+  - success
+
+pre-commit:
+  jobs:
+    - name: auto-commit
+      run: |
+        for file in $(git diff --cached --name-only); do
+          status=$(git diff --cached --name-status | grep "^[AMD]\s*$file$" | cut -f1)
+          case $status in
+            A) message="Add $file" ;;
+            M) message="Update $file" ;;
+            D) message="Delete $file" ;;
+            *) message="$file" ;;
+          esac
+          git commit --no-verify -m "$message" "$file"
+        done
