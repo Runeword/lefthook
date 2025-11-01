@@ -6,15 +6,14 @@ First install [lefthook](https://github.com/evilmartians/lefthook), then in the 
 
 1. Create a lefthook.yml config file
 ```shell
-touch lefthook.yml
-```
-
-```yaml
+cat <<EOF > lefthook.yml
 remotes:
   - git_url: https://github.com/Runeword/lefthook
     configs:
       - precommit-auto-msg.yml
+EOF
 ```
+
 2. Install git hooks defined in the lefthook config
 ```shell
 lefthook install
