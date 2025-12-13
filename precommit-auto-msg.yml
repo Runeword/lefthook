@@ -3,10 +3,36 @@ skip_output:
   - success
 
 pre-commit:
-  jobs:
-    - name: precommit-auto-msg
+  commands:
+    auto-commit:
+      priority: 100
       run: |
-        for file in $(git diff --cached --name-only); do
+        # Check if AUTO_COMMIT marker is set (to avoid recursion)
+        if [ "$AUTO_COMMIT" = "1" ]; then
+          exit 0
+        fi
+
+        # Check if user provided a message (if so, skip auto-commit)
+        if git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
+          exit 0
+        fi
+
+        # Re-stage any files modified by formatting hooks
+        git diff --name-only | while read -r file; do
+          if git diff --cached --name-only | grep -q "^$file$"; then
+            git add "$file"
+          fi
+        done
+
+        # Get all staged files
+        STAGED_FILES=$(git diff --cached --name-only)
+
+        if [ -z "$STAGED_FILES" ]; then
+          exit 0
+        fi
+
+        # Commit each file individually with auto-generated message
+        for file in $STAGED_FILES; do
           status=$(git diff --cached --name-status | grep "^[AMD]\s*$file$" | cut -f1)
           case $status in
             A) message="Add $file" ;;
@@ -14,5 +40,11 @@ pre-commit:
             D) message="Delete $file" ;;
             *) message="$file" ;;
           esac
-          git commit --no-verify -m "$message" "$file"
+
+          # Set marker to prevent recursion and commit (suppress output)
+          echo "  → $message"
+          AUTO_COMMIT=1 LEFTHOOK=0 git commit -q -m "$message" "$file"
         done
+
+        # Exit with error to cancel the original commit (files already committed)
+        exit 1
