@@ -1,0 +1,10 @@
+skip_output:
+  - meta
+  - success
+
+pre-commit:
+  commands:
+    format-toml:
+      glob: "*.toml"
+      priority: 1
+      run: taplo format {staged_files}
