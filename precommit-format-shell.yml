@@ -1,0 +1,9 @@
+skip_output:
+  - meta
+
+pre-commit:
+  commands:
+    format-shell:
+      glob: "*.sh"
+      priority: 1
+      run: shfmt --write --diff --language-dialect posix {staged_files}
