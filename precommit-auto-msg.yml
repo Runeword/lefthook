@@ -18,8 +18,9 @@ pre-commit:
         fi
 
         # Re-stage any files modified by formatting hooks
-        git diff --name-only | while read -r file; do
-          if git diff --cached --name-only | grep -q "^$file$"; then
+        # Check each originally staged file for modifications
+        for file in $(git diff --cached --name-only); do
+          if [ -f "$file" ]; then
             git add "$file"
           fi
         done
