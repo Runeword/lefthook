@@ -1,0 +1,17 @@
+skip_output:
+  - meta
+  - success
+
+post-checkout:
+  jobs:
+    - name: worktree-copy-env
+      run: |
+        #!/bin/bash
+        set -e
+        current_path=$(pwd)
+        main_path=$(git worktree list | grep -v "$current_path" | awk '{print $1}')
+        if [ -z "$main_path" ]; then
+          exit 0
+        fi
+        cd "$main_path"
+        git ls-files --others --ignored --exclude-standard | grep '\.env' | rsync -a --files-from=- . "$current_path"
