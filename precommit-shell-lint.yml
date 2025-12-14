@@ -1,0 +1,10 @@
+skip_output:
+  - meta
+  - success
+
+pre-commit:
+  commands:
+    lint-shell:
+      glob: "*.sh"
+      priority: 2
+      run: shellcheck {staged_files}
