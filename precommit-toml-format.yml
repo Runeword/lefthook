@@ -1,9 +1,0 @@
-skip_output:
-  - meta
-
-pre-commit:
-  commands:
-    format-toml:
-      glob: "*.toml"
-      priority: 1
-      run: taplo format --check {staged_files} 2>&1 || taplo format {staged_files}
