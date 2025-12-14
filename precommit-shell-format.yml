@@ -1,9 +1,0 @@
-skip_output:
-  - meta
-
-pre-commit:
-  commands:
-    format-shell:
-      glob: "*.sh"
-      priority: 1
-      run: shfmt -w -i 2 -ln posix -d {staged_files}
