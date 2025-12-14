@@ -1,9 +1,0 @@
-skip_output:
-  - meta
-
-pre-commit:
-  commands:
-    format-nix:
-      glob: "*.nix"
-      priority: 1
-      run: nixfmt --check {staged_files} 2>&1 || nixfmt {staged_files}
