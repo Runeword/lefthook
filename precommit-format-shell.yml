@@ -6,4 +6,6 @@ pre-commit:
     format-shell:
       glob: "*.sh"
       priority: 1
-      run: shfmt --write --diff --language-dialect posix {staged_files}
+      run: |
+        shfmt --write --diff --indent 2 --case-indent --language-dialect posix --simplify {staged_files}
+        shellharden --replace {staged_files}
