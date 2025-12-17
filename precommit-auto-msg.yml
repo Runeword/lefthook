@@ -17,6 +17,14 @@ pre-commit:
           exit 0
         fi
 
+        # Stash unstaged changes to preserve them
+        STASH_HASH=""
+        if ! git diff --quiet; then
+          git stash push -u -m "lefthook-auto-commit-$(date +%s)" --keep-index >/dev/null 2>&1
+          # Capture the exact stash hash (most recent stash)
+          STASH_HASH=$(git rev-parse stash@{0} 2>/dev/null)
+        fi
+
         # Re-stage any files modified by formatting hooks
         # Check each originally staged file for modifications
         for file in $(git diff --cached --name-only); do
@@ -29,6 +37,11 @@ pre-commit:
         STAGED_FILES=$(git diff --cached --name-only)
 
         if [ -z "$STAGED_FILES" ]; then
+          # Restore unstaged changes if we stashed them
+          if [ -n "$STASH_HASH" ]; then
+            git stash apply "$STASH_HASH" >/dev/null 2>&1
+            git stash drop "$STASH_HASH" >/dev/null 2>&1
+          fi
           exit 0
         fi
 
@@ -46,6 +59,12 @@ pre-commit:
           echo "  → $message"
           AUTO_COMMIT=1 LEFTHOOK=0 git commit -q -m "$message" "$file"
         done
+
+        # Restore unstaged changes if we stashed them
+        if [ -n "$STASH_HASH" ]; then
+          git stash apply "$STASH_HASH" >/dev/null 2>&1
+          git stash drop "$STASH_HASH" >/dev/null 2>&1
+        fi
 
         # Exit with error to cancel the original commit (files already committed)
         exit 1
