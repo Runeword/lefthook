@@ -7,69 +7,26 @@ pre-commit:
     auto-commit:
       priority: 100
       run: |
-        # Check if AUTO_COMMIT marker is set (to avoid recursion)
-        if [ "$AUTO_COMMIT" = "1" ]; then
-          exit 0
-        fi
+        # Avoid recursion
+        [ "$AUTO_COMMIT" = "1" ] && exit 0
 
-        # Check if user provided a message (if so, skip auto-commit)
-        if git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
-          exit 0
-        fi
+        # Re-stage files modified by formatters
+        git diff --cached --name-only | xargs -r git add
 
-        # Re-stage any files modified by formatting hooks FIRST
-        # Check each originally staged file for modifications
-        for file in $(git diff --cached --name-only); do
-          if [ -f "$file" ]; then
-            git add "$file"
-          fi
-        done
-
-        # Stash unstaged changes to preserve them (AFTER re-staging formatted files)
-        STASH_HASH=""
-        if ! git diff --quiet; then
-          # Create stash and immediately capture its hash atomically
-          git stash push -u -m "lefthook-auto-commit-$(date +%s)" --keep-index >/dev/null 2>&1
-          STASH_HASH=$(git rev-parse -q --verify refs/stash 2>/dev/null)
-        fi
-
-        # Get all staged files
-        STAGED_FILES=$(git diff --cached --name-only)
-
-        if [ -z "$STAGED_FILES" ]; then
-          # Restore unstaged changes if we stashed them
-          if [ -n "$STASH_HASH" ]; then
-            git stash pop --index "$STASH_HASH" >/dev/null 2>&1 || \
-              git stash pop "$STASH_HASH" >/dev/null 2>&1
-          fi
-          exit 0
-        fi
-
-        # Commit each file individually with auto-generated message
-        # Use null-delimited output to handle filenames with spaces/special chars
-        git diff --cached --name-status -z | while IFS= read -r -d '' status_line; do
+        # Auto-commit each staged file individually
+        git diff --cached --name-status -z | while IFS= read -r -d '' status; do
           IFS= read -r -d '' file || break
 
-          status="${status_line:0:1}"
-          case $status in
+          case "${status:0:1}" in
             A) message="Add $file" ;;
             M) message="Update $file" ;;
             D) message="Delete $file" ;;
             *) message="$file" ;;
           esac
 
-          # Set marker to prevent recursion and commit (suppress output)
           echo "  → $message"
           AUTO_COMMIT=1 LEFTHOOK=0 git commit -q -m "$message" -- "$file" 2>/dev/null || true
         done
 
-        # Restore unstaged changes if we stashed them
-        if [ -n "$STASH_HASH" ]; then
-          # Use the hash directly to pop (apply + drop atomically)
-          # This is safer than apply + drop separately
-          git stash pop --index "$STASH_HASH" >/dev/null 2>&1 || \
-            git stash pop "$STASH_HASH" >/dev/null 2>&1
-        fi
-
-        # Exit with error to cancel the original commit (files already committed)
+        # Cancel original commit (files already committed individually)
         exit 1
