@@ -1,0 +1,9 @@
+skip_output:
+  - meta
+
+pre-commit:
+  commands:
+    format-lua:
+      glob: "*.lua"
+      priority: 1
+      run: stylua {staged_files}
