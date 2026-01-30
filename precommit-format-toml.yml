@@ -7,4 +7,6 @@ pre-commit:
     format-toml:
       glob: "*.toml"
       priority: 1
+      env:
+        RUST_LOG: warn
       run: taplo format --quiet {staged_files}
