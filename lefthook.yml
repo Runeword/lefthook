@@ -2,3 +2,5 @@ remotes:
   - git_url: https://github.com/Runeword/lefthook
     configs:
       - precommit-auto-msg.yml
+      - precommit-format-nix.yml
+      - precommit-format-yaml.yml
