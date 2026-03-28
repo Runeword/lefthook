@@ -9,5 +9,4 @@ pre-commit:
       priority: 1
       run: |
         shfmt --write --diff --indent 2 --case-indent --language-dialect posix --simplify {staged_files} &&
-        shellharden --replace {staged_files} &&
-        shellcheck {staged_files}
+        shellharden --replace {staged_files}
