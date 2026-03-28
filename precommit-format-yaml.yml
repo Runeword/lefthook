@@ -1,0 +1,10 @@
+skip_output:
+  - meta
+
+pre-commit:
+  parallel: true
+  commands:
+    format-yaml:
+      glob: "*.{yml,yaml}"
+      priority: 1
+      run: yamlfmt {staged_files}
