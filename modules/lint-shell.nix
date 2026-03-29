@@ -1,5 +1,7 @@
-{ self }:
+{ self, pkgs, ... }:
 {
-  buildInputs = pkgs: [ pkgs.shellcheck ];
-  configFile = "${self}/precommit-lint-shell.yml";
+  config = {
+    buildInputs = [ pkgs.shellcheck ];
+    configFiles = [ "${self}/precommit-lint-shell.yml" ];
+  };
 }
