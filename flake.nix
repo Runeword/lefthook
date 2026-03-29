@@ -22,9 +22,11 @@
           pkgs.mkShell {
             buildInputs = nixpkgs.lib.concatMap (m: m.buildInputs pkgs) modules ++ [ pkgs.lefthook ];
             shellHook = ''
-              ln -sfn ${configFile} lefthook.local.yml
+              if [ "$(readlink lefthook.local.yml 2>/dev/null)" != "${configFile}" ]; then
+                ln -sfn ${configFile} lefthook.local.yml
+                lefthook install
+              fi
               [ -f lefthook.yml ] || printf 'extends:\n  - lefthook.local.yml\n' > lefthook.yml
-              lefthook install
             '';
           };
         auto-msg = mkModule ./modules/auto-msg.nix;
