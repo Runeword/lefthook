@@ -1,7 +1,6 @@
 skip_output:
   - meta
   - success
-
 pre-commit:
   commands:
     auto-commit:
@@ -11,7 +10,7 @@ pre-commit:
         [ "$AUTO_COMMIT" = "1" ] && exit 0
 
         # Re-stage files modified by formatters
-        git diff --cached --name-only | xargs -r git add
+        git diff --cached --name-only --diff-filter=d | xargs -r git add
 
         # Auto-commit each staged file individually
         git diff --cached --name-status -z | while IFS= read -r -d '' status; do
