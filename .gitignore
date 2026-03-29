@@ -1,2 +1,2 @@
 .direnv/
-.lefthook.d/
+lefthook.local.yml

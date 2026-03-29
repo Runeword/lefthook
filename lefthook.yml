@@ -1,2 +1,0 @@
-extends:
-  - .lefthook.d/*.yml
