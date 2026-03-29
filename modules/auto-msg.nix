@@ -1,5 +1,4 @@
-{ self }:
+{ self, ... }:
 {
-  buildInputs = pkgs: [ ];
-  configFile = "${self}/precommit-auto-msg.yml";
+  config.configFiles = [ "${self}/precommit-auto-msg.yml" ];
 }
