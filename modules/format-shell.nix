@@ -1,8 +1,10 @@
-{ self }:
+{ self, pkgs, ... }:
 {
-  buildInputs = pkgs: [
-    pkgs.shfmt
-    pkgs.shellharden
-  ];
-  configFile = "${self}/precommit-format-shell.yml";
+  config = {
+    buildInputs = [
+      pkgs.shfmt
+      pkgs.shellharden
+    ];
+    configFiles = [ "${self}/precommit-format-shell.yml" ];
+  };
 }
