@@ -1,5 +1,5 @@
 { self }:
 {
-  buildInputs = pkgs: [ pkgs.nixfmt-rfc-style ];
+  buildInputs = pkgs: [ pkgs.nixfmt ];
   configFile = "${self}/precommit-format-nix.yml";
 }
