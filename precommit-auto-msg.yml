@@ -1,6 +1,3 @@
-skip_output:
-  - meta
-  - success
 pre-commit:
   commands:
     auto-commit:
