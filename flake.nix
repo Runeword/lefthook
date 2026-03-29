@@ -10,31 +10,38 @@
         "x86_64-darwin"
         "aarch64-darwin"
       ];
-      mkModule = path: import path { inherit self; };
       lib = {
         mkShell =
           pkgs: modules:
           let
+            eval = nixpkgs.lib.evalModules {
+              modules = [
+                ./lib/options.nix
+                { _module.args = { inherit pkgs self; }; }
+              ]
+              ++ modules;
+            };
             configFile = (pkgs.formats.yaml { }).generate "lefthook-local" {
-              extends = map (m: m.configFile) modules;
+              extends = eval.config.configFiles;
             };
           in
           pkgs.mkShell {
-            buildInputs = nixpkgs.lib.concatMap (m: m.buildInputs pkgs) modules ++ [ pkgs.lefthook ];
+            buildInputs = eval.config.buildInputs ++ [ pkgs.lefthook ];
             shellHook = ''
               if [ "$(readlink lefthook.local.yml 2>/dev/null)" != "${configFile}" ]; then
                 ln -sfn ${configFile} lefthook.local.yml
+                lefthook uninstall
                 lefthook install
               fi
               [ -f lefthook.yml ] || printf 'extends:\n  - lefthook.local.yml\n' > lefthook.yml
             '';
           };
-        auto-msg = mkModule ./modules/auto-msg.nix;
-        format-nix = mkModule ./modules/format-nix.nix;
-        format-shell = mkModule ./modules/format-shell.nix;
-        format-toml = mkModule ./modules/format-toml.nix;
-        format-yaml = mkModule ./modules/format-yaml.nix;
-        lint-shell = mkModule ./modules/lint-shell.nix;
+        auto-msg = ./modules/auto-msg.nix;
+        format-nix = ./modules/format-nix.nix;
+        format-shell = ./modules/format-shell.nix;
+        format-toml = ./modules/format-toml.nix;
+        format-yaml = ./modules/format-yaml.nix;
+        lint-shell = ./modules/lint-shell.nix;
       };
     in
     {
