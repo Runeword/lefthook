@@ -1,5 +1,7 @@
-{ self }:
+{ self, pkgs, ... }:
 {
-  buildInputs = pkgs: [ pkgs.nixfmt ];
-  configFile = "${self}/precommit-format-nix.yml";
+  config = {
+    buildInputs = [ pkgs.nixfmt ];
+    configFiles = [ "${self}/precommit-format-nix.yml" ];
+  };
 }
