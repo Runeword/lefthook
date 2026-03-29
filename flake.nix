@@ -23,6 +23,7 @@
             buildInputs = nixpkgs.lib.concatMap (m: m.buildInputs pkgs) modules ++ [ pkgs.lefthook ];
             shellHook = ''
               ln -sfn ${configFile} lefthook.local.yml
+              [ -f lefthook.yml ] || printf 'extends:\n  - lefthook.local.yml\n' > lefthook.yml
               lefthook install
             '';
           };
@@ -43,7 +44,8 @@
         in
         {
           default = lib.mkShell pkgs (
-            with lib; [
+            with lib;
+            [
               auto-msg
               format-nix
               format-shell
