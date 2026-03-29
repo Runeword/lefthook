@@ -1,5 +1,7 @@
-{ self }:
+{ self, pkgs, ... }:
 {
-  buildInputs = pkgs: [ pkgs.taplo ];
-  configFile = "${self}/precommit-format-toml.yml";
+  config = {
+    buildInputs = [ pkgs.taplo ];
+    configFiles = [ "${self}/precommit-format-toml.yml" ];
+  };
 }
