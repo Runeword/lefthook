@@ -10,8 +10,18 @@
         "x86_64-darwin"
         "aarch64-darwin"
       ];
+      lib = {
+        mkShell =
+          pkgs: modules:
+          pkgs.mkShell {
+            inputsFrom = modules;
+            buildInputs = [ pkgs.lefthook ];
+            shellHook = "lefthook install";
+          };
+      };
     in
     {
+      inherit lib;
       devShells = nixpkgs.lib.genAttrs systems (
         system:
         let
@@ -28,13 +38,7 @@
         in
         modules
         // {
-          default = pkgs.mkShell {
-            inputsFrom = builtins.attrValues modules;
-            buildInputs = [ pkgs.lefthook ];
-            shellHook = ''
-              lefthook install
-            '';
-          };
+          default = lib.mkShell pkgs (builtins.attrValues modules);
         }
       );
     };
