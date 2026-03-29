@@ -12,7 +12,7 @@
       ];
       lib = {
         mkShell =
-          pkgs: modules:
+          { pkgs, modules }:
           let
             eval = nixpkgs.lib.evalModules {
               modules = [
@@ -52,17 +52,17 @@
           pkgs = nixpkgs.legacyPackages.${system};
         in
         {
-          default = lib.mkShell pkgs (
-            with lib;
-            [
+          default = lib.mkShell {
+            inherit pkgs;
+            modules = with lib; [
               auto-msg
               format-nix
               format-shell
               format-toml
               format-yaml
               lint-shell
-            ]
-          );
+            ];
+          };
         }
       );
     };
