@@ -1,6 +1,3 @@
-skip_output:
-  - meta
-
 pre-commit:
   parallel: true
   commands:
