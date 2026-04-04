@@ -1,0 +1,7 @@
+pre-commit:
+  parallel: true
+  commands:
+    format-go:
+      glob: "*.go"
+      priority: 1
+      run: goimports -w {staged_files}
