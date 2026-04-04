@@ -4,4 +4,4 @@ pre-commit:
     format-go:
       glob: "*.go"
       priority: 1
-      run: goimports -w {staged_files}
+      run: gofumpt -w {staged_files}
