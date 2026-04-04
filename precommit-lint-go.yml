@@ -1,0 +1,7 @@
+pre-commit:
+  parallel: true
+  commands:
+    lint-go:
+      glob: "*.go"
+      priority: 2
+      run: golangci-lint run
