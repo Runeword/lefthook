@@ -37,11 +37,13 @@
             '';
           };
         auto-msg = ./modules/auto-msg.nix;
+        format-go = ./modules/format-go.nix;
         format-lua = ./modules/format-lua.nix;
         format-nix = ./modules/format-nix.nix;
         format-shell = ./modules/format-shell.nix;
         format-toml = ./modules/format-toml.nix;
         format-yaml = ./modules/format-yaml.nix;
+        lint-go = ./modules/lint-go.nix;
         lint-shell = ./modules/lint-shell.nix;
       };
     in
