@@ -1,7 +1,7 @@
 { self, pkgs, ... }:
 {
   config = {
-    buildInputs = [ pkgs.gotools ];
+    buildInputs = [ pkgs.gofumpt ];
     configFiles = [ "${self}/precommit-format-go.yml" ];
   };
 }
