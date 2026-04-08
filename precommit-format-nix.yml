@@ -4,4 +4,4 @@ pre-commit:
     format-nix:
       glob: "*.nix"
       priority: 1
-      run: nixfmt {staged_files}
+      run: format-nix {staged_files}
