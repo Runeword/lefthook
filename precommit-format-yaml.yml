@@ -4,4 +4,4 @@ pre-commit:
     format-yaml:
       glob: "*.{yml,yaml}"
       priority: 1
-      run: yamlfmt {staged_files}
+      run: format-yaml {staged_files}
