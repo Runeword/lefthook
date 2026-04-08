@@ -4,4 +4,4 @@ pre-commit:
     format-lua:
       glob: "*.lua"
       priority: 1
-      run: stylua {staged_files}
+      run: format-lua {staged_files}
