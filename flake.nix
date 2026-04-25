@@ -44,6 +44,7 @@
         format-toml = ./modules/format-toml.nix;
         format-yaml = ./modules/format-yaml.nix;
         lint-go = ./modules/lint-go.nix;
+        lint-nix = ./modules/lint-nix.nix;
         lint-shell = ./modules/lint-shell.nix;
       };
     in
@@ -63,6 +64,7 @@
               format-shell
               format-toml
               format-yaml
+              lint-nix
               lint-shell
             ];
           };
