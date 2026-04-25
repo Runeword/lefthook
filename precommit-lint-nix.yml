@@ -1,0 +1,11 @@
+pre-commit:
+  parallel: true
+  commands:
+    lint-nix-deadnix:
+      glob: "*.nix"
+      priority: 2
+      run: deadnix --fail {staged_files}
+    lint-nix-statix:
+      glob: "*.nix"
+      priority: 2
+      run: for f in {staged_files}; do statix check "$f" || exit 1; done
