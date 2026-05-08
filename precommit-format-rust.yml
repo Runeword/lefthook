@@ -1,0 +1,7 @@
+pre-commit:
+  parallel: true
+  commands:
+    format-rust:
+      glob: "*.rs"
+      priority: 1
+      run: format-rust {staged_files}
