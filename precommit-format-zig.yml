@@ -1,0 +1,7 @@
+pre-commit:
+  parallel: true
+  commands:
+    format-zig:
+      glob: "*.{zig,zon}"
+      priority: 1
+      run: format-zig {staged_files}
