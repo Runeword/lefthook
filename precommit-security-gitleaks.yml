@@ -1,0 +1,6 @@
+pre-commit:
+  parallel: true
+  commands:
+    security-gitleaks:
+      priority: 2
+      run: gitleaks git --pre-commit --redact --staged --verbose --no-banner --log-level=warn
