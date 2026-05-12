@@ -48,6 +48,7 @@
         lint-go = ./modules/lint-go.nix;
         lint-nix = ./modules/lint-nix.nix;
         lint-shell = ./modules/lint-shell.nix;
+        security-gitleaks = ./modules/security-gitleaks.nix;
       };
     in
     {
