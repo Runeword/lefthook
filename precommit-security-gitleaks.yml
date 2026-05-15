@@ -1,6 +1,8 @@
 pre-commit:
-  parallel: true
-  commands:
-    security-gitleaks:
-      priority: 2
-      run: gitleaks git --pre-commit --redact --staged --verbose --no-banner --log-level=warn
+  jobs:
+    - name: main
+      group:
+        parallel: true
+        jobs:
+          - name: security-gitleaks
+            run: security-gitleaks
