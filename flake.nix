@@ -14,15 +14,19 @@
         mkShell =
           { pkgs, modules }:
           let
-            eval = nixpkgs.lib.evalModules {
+            inherit (nixpkgs) lib;
+            eval = lib.evalModules {
               modules = [
                 ./lib/options.nix
                 { _module.args = { inherit pkgs self; }; }
               ]
               ++ modules;
             };
+            # evalModules concatenates list-typed contributions in reverse
+            # module-list order; reverse to restore the consumer's intent.
+            extends = lib.unique (lib.reverseList eval.config.configFiles);
             configFile = (pkgs.formats.yaml { }).generate "lefthook-local" {
-              extends = eval.config.configFiles;
+              inherit extends;
             };
           in
           pkgs.mkShell {
@@ -40,6 +44,7 @@
         format-go = ./modules/format-go.nix;
         format-lua = ./modules/format-lua.nix;
         format-nix = ./modules/format-nix.nix;
+        format-opentofu = ./modules/format-opentofu.nix;
         format-rust = ./modules/format-rust.nix;
         format-shell = ./modules/format-shell.nix;
         format-toml = ./modules/format-toml.nix;
@@ -47,8 +52,10 @@
         format-zig = ./modules/format-zig.nix;
         lint-go = ./modules/lint-go.nix;
         lint-nix = ./modules/lint-nix.nix;
+        lint-opentofu = ./modules/lint-opentofu.nix;
         lint-shell = ./modules/lint-shell.nix;
         security-gitleaks = ./modules/security-gitleaks.nix;
+        security-opentofu = ./modules/security-opentofu.nix;
       };
     in
     {
@@ -62,13 +69,13 @@
           default = lib.mkShell {
             inherit pkgs;
             modules = with lib; [
-              auto-msg
               format-nix
               format-shell
               format-toml
               format-yaml
               lint-nix
               lint-shell
+              auto-msg
             ];
           };
         }
