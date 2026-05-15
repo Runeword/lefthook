@@ -12,7 +12,7 @@ in
     configFiles = mkOption {
       type = types.listOf types.path;
       default = [ ];
-      description = "Lefthook YAML configuration files to extend.";
+      description = "Lefthook YAML configs to extend.";
     };
   };
 }
