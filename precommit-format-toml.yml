@@ -1,7 +1,13 @@
 pre-commit:
-  parallel: true
-  commands:
-    format-toml:
-      glob: "*.toml"
-      priority: 1
-      run: format-toml {staged_files}
+  jobs:
+    - name: main
+      group:
+        parallel: true
+        jobs:
+          - name: toml
+            group:
+              piped: true
+              jobs:
+                - name: format-toml
+                  glob: "*.toml"
+                  run: format-toml {staged_files}
