@@ -1,0 +1,13 @@
+pre-commit:
+  jobs:
+    - name: main
+      group:
+        parallel: true
+        jobs:
+          - name: opentofu
+            group:
+              piped: true
+              jobs:
+                - name: lint-opentofu
+                  glob: "*.{tf,tofu}"
+                  run: lint-opentofu
