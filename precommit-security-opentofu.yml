@@ -1,0 +1,13 @@
+pre-commit:
+  jobs:
+    - name: main
+      group:
+        parallel: true
+        jobs:
+          - name: opentofu
+            group:
+              piped: true
+              jobs:
+                - name: security-opentofu
+                  glob: "*.{tf,tofu,tfvars}"
+                  run: security-opentofu {staged_files}
