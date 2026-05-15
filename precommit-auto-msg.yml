@@ -1,28 +1,8 @@
 pre-commit:
-  commands:
-    auto-commit:
-      priority: 100
-      run: |
-        # Avoid recursion
-        [ "$AUTO_COMMIT" = "1" ] && exit 0
-
-        # Re-stage files modified by formatters
-        git diff --cached --name-only --diff-filter=d | xargs -r git add
-
-        # Auto-commit each staged file individually
-        git diff --cached --name-status -z | while IFS= read -r -d '' status; do
-          IFS= read -r -d '' file || break
-
-          case "${status:0:1}" in
-            A) message="Add $file" ;;
-            M) message="Update $file" ;;
-            D) message="Delete $file" ;;
-            *) message="$file" ;;
-          esac
-
-          echo "  → $message"
-          AUTO_COMMIT=1 LEFTHOOK=0 git commit -q -m "$message" -- "$file" 2>/dev/null || true
-        done
-
-        # Cancel original commit (files already committed individually)
-        exit 1
+  jobs:
+    - name: finalize
+      group:
+        parallel: true
+        jobs:
+          - name: auto-commit
+            run: auto-commit
