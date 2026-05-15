@@ -1,7 +1,13 @@
 pre-commit:
-  parallel: true
-  commands:
-    lint-shell:
-      glob: "*.sh"
-      priority: 2
-      run: shellcheck {staged_files}
+  jobs:
+    - name: main
+      group:
+        parallel: true
+        jobs:
+          - name: shell
+            group:
+              piped: true
+              jobs:
+                - name: lint-shell
+                  glob: "*.sh"
+                  run: lint-shell {staged_files}
