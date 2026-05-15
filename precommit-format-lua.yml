@@ -1,7 +1,13 @@
 pre-commit:
-  parallel: true
-  commands:
-    format-lua:
-      glob: "*.lua"
-      priority: 1
-      run: format-lua {staged_files}
+  jobs:
+    - name: main
+      group:
+        parallel: true
+        jobs:
+          - name: lua
+            group:
+              piped: true
+              jobs:
+                - name: format-lua
+                  glob: "*.lua"
+                  run: format-lua {staged_files}
