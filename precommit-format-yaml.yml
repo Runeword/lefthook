@@ -1,7 +1,13 @@
 pre-commit:
-  parallel: true
-  commands:
-    format-yaml:
-      glob: "*.{yml,yaml}"
-      priority: 1
-      run: format-yaml {staged_files}
+  jobs:
+    - name: main
+      group:
+        parallel: true
+        jobs:
+          - name: yaml
+            group:
+              piped: true
+              jobs:
+                - name: format-yaml
+                  glob: "*.{yml,yaml}"
+                  run: format-yaml {staged_files}
