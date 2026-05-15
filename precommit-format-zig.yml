@@ -1,7 +1,13 @@
 pre-commit:
-  parallel: true
-  commands:
-    format-zig:
-      glob: "*.{zig,zon}"
-      priority: 1
-      run: format-zig {staged_files}
+  jobs:
+    - name: main
+      group:
+        parallel: true
+        jobs:
+          - name: zig
+            group:
+              piped: true
+              jobs:
+                - name: format-zig
+                  glob: "*.{zig,zon}"
+                  run: format-zig {staged_files}
