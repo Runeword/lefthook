@@ -1,7 +1,13 @@
 pre-commit:
-  parallel: true
-  commands:
-    format-nix:
-      glob: "*.nix"
-      priority: 1
-      run: format-nix {staged_files}
+  jobs:
+    - name: main
+      group:
+        parallel: true
+        jobs:
+          - name: nix
+            group:
+              piped: true
+              jobs:
+                - name: format-nix
+                  glob: "*.nix"
+                  run: format-nix {staged_files}
