@@ -1,7 +1,13 @@
 pre-commit:
-  parallel: true
-  commands:
-    format-rust:
-      glob: "*.rs"
-      priority: 1
-      run: format-rust {staged_files}
+  jobs:
+    - name: main
+      group:
+        parallel: true
+        jobs:
+          - name: rust
+            group:
+              piped: true
+              jobs:
+                - name: format-rust
+                  glob: "*.rs"
+                  run: format-rust {staged_files}
