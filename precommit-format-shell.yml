@@ -1,7 +1,13 @@
 pre-commit:
-  parallel: true
-  commands:
-    format-shell:
-      glob: "*.sh"
-      priority: 1
-      run: format-shell {staged_files}
+  jobs:
+    - name: main
+      group:
+        parallel: true
+        jobs:
+          - name: shell
+            group:
+              piped: true
+              jobs:
+                - name: format-shell
+                  glob: "*.sh"
+                  run: format-shell {staged_files}
