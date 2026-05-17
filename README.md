@@ -6,7 +6,7 @@ The flake exposes:
 
 - `packages.<system>.<hook>` — wrapper binaries (e.g. `format-nix`, `lint-go`, `auto-commit`)
 - `precommit-<hook>.yml` files in the flake source — lefthook YAML fragments (the filename matches each wrapper's name)
-- `lib.<system>.mkShell { hooks }` — given a list of hook packages, returns a `pkgs.mkShell` derivation with the hooks plus `pkgs.lefthook` in `buildInputs` and a `shellHook` that generates `lefthook.local.yml`, ensures `lefthook.yml` exists, and runs `lefthook install`. Drop it into your own shell's `inputsFrom`.
+- `lib.<system>.mkShell { hooks }` — module-style factory. `hooks` is an attrset where each known hook can be enabled with `<name>.enable = true`. Returns a `pkgs.mkShell` derivation with the enabled binaries plus `pkgs.lefthook` on PATH and a `shellHook` that generates `lefthook.local.yml`, ensures `lefthook.yml` exists, and runs `lefthook install`. Drop it into your own shell's `inputsFrom`. Unknown hook names error at evaluation with a "Did you mean…?" suggestion (NixOS-module style, à la [cachix/git-hooks.nix](https://github.com/cachix/git-hooks.nix) and [numtide/treefmt-nix](https://github.com/numtide/treefmt-nix)).
 
 ## Installation
 
@@ -23,22 +23,22 @@ Then in your devShell:
 pkgs.mkShell {
   inputsFrom = [
     (lefthook.lib.${pkgs.system}.mkShell {
-      hooks = with lefthook.packages.${pkgs.system}; [
+      hooks = {
         # per-language: format → lint → security
-        format-nix
-        lint-nix
-        format-shell
-        lint-shell
-        security-gitleaks
+        format-nix.enable        = true;
+        lint-nix.enable          = true;
+        format-shell.enable      = true;
+        lint-shell.enable        = true;
+        security-gitleaks.enable = true;
         # commit-message automation (keep last)
-        auto-commit
-      ];
+        auto-commit.enable       = true;
+      };
     })
   ];
 }
 ```
 
-The single `hooks` list is the source of truth: `mkShell` puts each hook's binary on PATH and derives the YAML fragments lefthook should extend from each package's name. `pkgs.lefthook` is injected automatically.
+Each `<name>.enable = true` selects a hook from `lefthook.packages.<system>` (binary + matching YAML fragment, bundled via `passthru.lefthookFragment`). `mkShell` puts the enabled binaries on PATH, generates `lefthook.local.yml` extending the matching fragments, and runs `lefthook install`. `pkgs.lefthook` is injected automatically.
 
 ## Ordering
 
