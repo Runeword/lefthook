@@ -6,9 +6,7 @@ The flake exposes:
 
 - `packages.<system>.<hook>` — wrapper binaries (e.g. `format-nix`, `lint-go`, `auto-commit`)
 - `precommit-<hook>.yml` files in the flake source — lefthook YAML fragments (the filename matches each wrapper's name)
-- `lib.installHook hookPkgs` — given a list of hook packages, returns a shellHook string that generates `lefthook.local.yml`, ensures `lefthook.yml` exists, and runs `lefthook install`
-
-Consumers call `pkgs.mkShell` themselves and pick which hooks they want, in one list.
+- `lib.<system>.mkShell { hooks }` — given a list of hook packages, returns a `pkgs.mkShell` derivation with the hooks plus `pkgs.lefthook` in `buildInputs` and a `shellHook` that generates `lefthook.local.yml`, ensures `lefthook.yml` exists, and runs `lefthook install`. Drop it into your own shell's `inputsFrom`.
 
 ## Installation
 
@@ -21,27 +19,26 @@ inputs.lefthook.url = "github:Runeword/lefthook";
 Then in your devShell:
 
 ```nix
-{ lefthook, pkgs }:
-let
-  hooks = lefthook.packages.${pkgs.stdenv.hostPlatform.system};
-  enabled = [
-    # per-language: format → lint → security
-    hooks.format-nix
-    hooks.lint-nix
-    hooks.format-shell
-    hooks.lint-shell
-    hooks.security-gitleaks
-    # commit-message automation (keep last)
-    hooks.auto-commit
-  ];
-in
+{ lefthook, pkgs, ... }:
 pkgs.mkShell {
-  buildInputs = enabled ++ [ pkgs.lefthook ];
-  shellHook = lefthook.lib.installHook enabled;
+  inputsFrom = [
+    (lefthook.lib.${pkgs.system}.mkShell {
+      hooks = with lefthook.packages.${pkgs.system}; [
+        # per-language: format → lint → security
+        format-nix
+        lint-nix
+        format-shell
+        lint-shell
+        security-gitleaks
+        # commit-message automation (keep last)
+        auto-commit
+      ];
+    })
+  ];
 }
 ```
 
-The single `enabled` list is the source of truth: it feeds `buildInputs` (binaries on PATH) and `installHook` (YAML fragments lefthook should extend, derived from each package's name).
+The single `hooks` list is the source of truth: `mkShell` puts each hook's binary on PATH and derives the YAML fragments lefthook should extend from each package's name. `pkgs.lefthook` is injected automatically.
 
 ## Ordering
 
