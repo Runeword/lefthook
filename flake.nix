@@ -16,27 +16,65 @@
         system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
+          inherit (nixpkgs) lib;
+
+          module =
+            { config, ... }:
+            let
+              available = self.packages.${system};
+              enabledHooks = map (name: available.${name}) (
+                lib.attrNames (lib.filterAttrs (_: cfg: cfg.enable) config.hooks)
+              );
+            in
+            {
+              options = {
+                hooks = lib.mkOption {
+                  type = lib.types.submodule {
+                    options = lib.mapAttrs (
+                      name: _:
+                      lib.mkOption {
+                        type = lib.types.submodule {
+                          options.enable = lib.mkEnableOption "the ${name} lefthook hook";
+                        };
+                        default = { };
+                        description = "Configuration for the ${name} hook.";
+                      }
+                    ) available;
+                  };
+                  default = { };
+                  description = "Per-hook configuration. Set `<hook>.enable = true` to activate.";
+                };
+
+                devShell = lib.mkOption {
+                  type = lib.types.package;
+                  readOnly = true;
+                  internal = true;
+                };
+              };
+
+              config.devShell = pkgs.mkShell {
+                buildInputs = enabledHooks ++ [ pkgs.lefthook ];
+                shellHook = ''
+                  rm -f lefthook.local.yml
+                  cat > lefthook.local.yml <<'EOF'
+                  extends:
+                  ${lib.concatMapStringsSep "\n" (p: "  - ${p.passthru.lefthookFragment}") enabledHooks}
+                  EOF
+                  [ -f lefthook.yml ] || printf 'extends:\n  - lefthook.local.yml\n' > lefthook.yml
+                  lefthook install
+                '';
+              };
+            };
         in
         {
           mkShell =
-            { hooks }:
-            let
-              extendsLines = builtins.concatStringsSep "\n" (
-                map (p: "  - ${self}/precommit-${p.name}.yml") hooks
-              );
-            in
-            pkgs.mkShell {
-              buildInputs = hooks ++ [ pkgs.lefthook ];
-              shellHook = ''
-                rm -f lefthook.local.yml
-                cat > lefthook.local.yml <<'EOF'
-                extends:
-                ${extendsLines}
-                EOF
-                [ -f lefthook.yml ] || printf 'extends:\n  - lefthook.local.yml\n' > lefthook.yml
-                lefthook install
-              '';
-            };
+            userConfig:
+            (lib.evalModules {
+              modules = [
+                module
+                userConfig
+              ];
+            }).config.devShell;
         }
       );
 
@@ -50,6 +88,7 @@
               inherit name runtimeInputs;
               bashOptions = [ ];
               text = builtins.readFile (./scripts + "/${name}.sh");
+              passthru.lefthookFragment = ./. + "/precommit-${name}.yml";
             };
         in
         {
@@ -78,24 +117,18 @@
         }
       );
 
-      devShells = nixpkgs.lib.genAttrs systems (
-        system:
-        let
-          pkgs = nixpkgs.legacyPackages.${system};
-          hooks = self.packages.${system};
-          enabled = [
-            hooks.format-nix
-            hooks.lint-nix
-            hooks.format-shell
-            hooks.lint-shell
-            hooks.format-toml
-            hooks.format-yaml
-            hooks.auto-commit
-          ];
-        in
-        {
-          default = self.lib.${system}.mkShell { hooks = enabled; };
-        }
-      );
+      devShells = nixpkgs.lib.genAttrs systems (system: {
+        default = self.lib.${system}.mkShell {
+          hooks = {
+            format-nix.enable = true;
+            lint-nix.enable = true;
+            format-shell.enable = true;
+            lint-shell.enable = true;
+            format-toml.enable = true;
+            format-yaml.enable = true;
+            auto-commit.enable = true;
+          };
+        };
+      });
     };
 }
