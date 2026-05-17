@@ -1,8 +1,0 @@
-pre-commit:
-  jobs:
-    - name: finalize
-      group:
-        parallel: true
-        jobs:
-          - name: auto-commit
-            run: auto-commit
