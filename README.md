@@ -1,73 +1,84 @@
 # Lefthook remote configs
-A collection of reusable [Lefthook](https://github.com/evilmartians/lefthook) configurations that can be shared across multiple projects.
+
+A collection of reusable [Lefthook](https://github.com/evilmartians/lefthook) hooks distributed as a Nix flake.
+
+The flake exposes:
+
+- `packages.<system>.<hook>` — wrapper binaries (e.g. `format-nix`, `lint-go`, `auto-commit`)
+- `precommit-<hook>.yml` files in the flake source — lefthook YAML fragments (the filename matches each wrapper's name)
+- `lib.installHook hookPkgs` — given a list of hook packages, returns a shellHook string that generates `lefthook.local.yml`, ensures `lefthook.yml` exists, and runs `lefthook install`
+
+Consumers call `pkgs.mkShell` themselves and pick which hooks they want, in one list.
 
 ## Installation
 
-### As a Nix flake module (recommended)
-
-Add this repo as a flake input and compose modules in your devShell:
+Add as a flake input:
 
 ```nix
 inputs.lefthook.url = "github:Runeword/lefthook";
-
-# in your devShell:
-lefthook.lib.mkShell {
-  inherit pkgs;
-  modules = with lefthook.lib; [
-    # per-language hooks: list format → lint → security
-    format-nix
-    lint-nix
-    format-go
-    lint-go
-    format-shell
-    lint-shell
-    format-opentofu
-    lint-opentofu
-    security-opentofu
-    # cross-language
-    security-gitleaks
-    # finalize: keep last
-    auto-msg
-  ];
-};
 ```
 
-Entering the shell installs the required binaries, generates `lefthook.local.yml`, and runs `lefthook install`.
+Then in your devShell:
 
-#### Ordering rule
+```nix
+{ lefthook, pkgs }:
+let
+  hooks = lefthook.packages.${pkgs.stdenv.hostPlatform.system};
+  enabled = [
+    # per-language: format → lint → security
+    hooks.format-nix
+    hooks.lint-nix
+    hooks.format-shell
+    hooks.lint-shell
+    hooks.security-gitleaks
+    # commit-message automation (keep last)
+    hooks.auto-commit
+  ];
+in
+pkgs.mkShell {
+  buildInputs = enabled ++ [ pkgs.lefthook ];
+  shellHook = lefthook.lib.installHook enabled;
+}
+```
 
-The order in your `modules = [...]` list is the execution order. Within a language, list the modules as `format → lint → security`. Put `auto-msg` last.
+The single `enabled` list is the source of truth: it feeds `buildInputs` (binaries on PATH) and `installHook` (YAML fragments lefthook should extend, derived from each package's name).
 
-#### Scheduling
+## Ordering
 
-Each `precommit-*.yml` declares a single hook nested under
-`pre-commit.jobs[main].group.jobs[<lang>].group.jobs[<tool>]` (or, for
-cross-language hooks, a flat job inside `main`; for `auto-msg`, a sibling
-`finalize` group).
+Lefthook merges `extends:` fragments by job name. List hooks as `format-<lang> → lint-<lang> → security-<lang>` within each language, and put `auto-commit` last. Lefthook auto-parallelizes language lanes; piped jobs within a lane stop on first failure.
 
-When `mkShell` extends multiple of them together, lefthook merges nested
-`jobs:` by name, so:
+## Available hooks
 
-- All language lanes (`nix`, `go`, `shell`, …) run in parallel inside `main`.
-- Within a lane, hooks run sequentially in the order their ymls were extended (piped, stops on first failure).
-- Cross-language hooks (e.g. `security-gitleaks`) live as flat jobs inside `main`, alongside the lanes.
-- `auto-msg` puts `auto-commit` in a sibling `finalize` group that runs strictly after `main`.
+Each hook ships a wrapper binary and a YAML fragment with the same name.
 
-### As remote configs
+| Hook                 | YAML file                            |
+| -------------------- | ------------------------------------ |
+| `auto-commit`        | `precommit-auto-commit.yml`          |
+| `format-go`          | `precommit-format-go.yml`            |
+| `format-lua`         | `precommit-format-lua.yml`           |
+| `format-nix`         | `precommit-format-nix.yml`           |
+| `format-opentofu`    | `precommit-format-opentofu.yml`      |
+| `format-rust`        | `precommit-format-rust.yml`          |
+| `format-shell`       | `precommit-format-shell.yml`         |
+| `format-toml`        | `precommit-format-toml.yml`          |
+| `format-yaml`        | `precommit-format-yaml.yml`          |
+| `format-zig`         | `precommit-format-zig.yml`           |
+| `lint-go`            | `precommit-lint-go.yml`              |
+| `lint-nix`           | `precommit-lint-nix.yml`             |
+| `lint-opentofu`      | `precommit-lint-opentofu.yml`        |
+| `lint-shell`         | `precommit-lint-shell.yml`           |
+| `security-gitleaks`  | `precommit-security-gitleaks.yml`    |
+| `security-opentofu`  | `precommit-security-opentofu.yml`    |
 
-Reference yml files directly via lefthook's `remotes:`:
+## Remote configs (without Nix)
 
-```shell
-cat <<EOF > lefthook.yml
+Alternatively, reference the YAML files directly via lefthook's own `remotes:`. Tools must be on PATH already in this mode.
+
+```yaml
 remotes:
   - git_url: https://github.com/Runeword/lefthook
     configs:
       - precommit-format-nix.yml
       - precommit-lint-nix.yml
-      - precommit-auto-msg.yml
-EOF
-
-lefthook install
+      - precommit-auto-commit.yml
 ```
-
-Lefthook's own `extends:` semantics produce the same nested jobs tree as the flake path. List the configs in the order `format → lint → security → auto-msg` so the within-lane order is correct.
