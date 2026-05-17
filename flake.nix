@@ -12,21 +12,33 @@
       ];
     in
     {
-      lib.installHook =
-        hookPkgs:
+      lib = nixpkgs.lib.genAttrs systems (
+        system:
         let
-          extendsLines = builtins.concatStringsSep "\n" (
-            map (p: "  - ${self}/precommit-${p.name}.yml") hookPkgs
-          );
+          pkgs = nixpkgs.legacyPackages.${system};
         in
-        ''
-          cat > lefthook.local.yml <<'EOF'
-          extends:
-          ${extendsLines}
-          EOF
-          [ -f lefthook.yml ] || printf 'extends:\n  - lefthook.local.yml\n' > lefthook.yml
-          lefthook install
-        '';
+        {
+          mkShell =
+            { hooks }:
+            let
+              extendsLines = builtins.concatStringsSep "\n" (
+                map (p: "  - ${self}/precommit-${p.name}.yml") hooks
+              );
+            in
+            pkgs.mkShell {
+              buildInputs = hooks ++ [ pkgs.lefthook ];
+              shellHook = ''
+                rm -f lefthook.local.yml
+                cat > lefthook.local.yml <<'EOF'
+                extends:
+                ${extendsLines}
+                EOF
+                [ -f lefthook.yml ] || printf 'extends:\n  - lefthook.local.yml\n' > lefthook.yml
+                lefthook install
+              '';
+            };
+        }
+      );
 
       packages = nixpkgs.lib.genAttrs systems (
         system:
@@ -82,10 +94,7 @@
           ];
         in
         {
-          default = pkgs.mkShell {
-            buildInputs = enabled ++ [ pkgs.lefthook ];
-            shellHook = self.lib.installHook enabled;
-          };
+          default = self.lib.${system}.mkShell { hooks = enabled; };
         }
       );
     };
