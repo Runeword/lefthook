@@ -55,13 +55,14 @@
               config.devShell = pkgs.mkShell {
                 buildInputs = enabledHooks ++ [ pkgs.lefthook ];
                 shellHook = ''
-                  rm -f lefthook.local.yml
-                  cat > lefthook.local.yml <<'EOF'
+                  project_root=$(git rev-parse --show-toplevel 2>/dev/null || echo "$PWD")
+                  rm -f "$project_root/lefthook.local.yml"
+                  cat > "$project_root/lefthook.local.yml" <<'EOF'
                   extends:
                   ${lib.concatMapStringsSep "\n" (p: "  - ${p.passthru.lefthookFragment}") enabledHooks}
                   EOF
-                  [ -f lefthook.yml ] || printf 'extends:\n  - lefthook.local.yml\n' > lefthook.yml
-                  lefthook install
+                  [ -f "$project_root/lefthook.yml" ] || printf 'extends:\n  - lefthook.local.yml\n' > "$project_root/lefthook.yml"
+                  ( cd "$project_root" && lefthook install )
                 '';
               };
             };
