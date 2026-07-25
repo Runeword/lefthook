@@ -3,8 +3,13 @@
 # Ordering is expressed as data, not inferred from attribute-set order:
 #   - lanes run in parallel under a `main` job,
 #   - jobs within a lane are piped in `order` (format -> lint -> security),
-#   - `auto-commit` runs in a `finalize` job after `main`,
+#   - `finalize` jobs (auto-commit) come after `main`,
 #   - `pre-commit` itself is piped, so a failing lane blocks `finalize`.
+#
+# The rendered config calls tools by bare name and is copied into the
+# consumer's repo as `lefthook-generated.yml`, meant to be committed: hooks
+# then exist from `git checkout` onward (fresh clones, new worktrees, after
+# garbage collection), independent of any machine's Nix store.
 {
   pkgs,
   lib,
@@ -14,26 +19,33 @@ let
   inherit (lib)
     attrNames
     concatMap
+    count
     filter
     mapAttrs
     mkEnableOption
     mkOption
     optional
-    optionalAttrs
     sort
     types
     unique
     ;
 
-  # A single lefthook job. Omit `glob`/`stage_fixed` when not set so the
-  # generated YAML stays minimal.
-  renderJob =
-    job:
-    {
-      inherit (job) name run;
-    }
-    // optionalAttrs (job ? glob) { inherit (job) glob; }
-    // optionalAttrs (job.stageFixed or false) { stage_fixed = true; };
+  # Reject malformed hook declarations loudly: a hook with zero roles would
+  # silently vanish from the config, one with two would be emitted twice.
+  validHook =
+    name: h:
+    if
+      count (b: b) [
+        (h ? lane)
+        (h.standalone or false)
+        (h.finalize or false)
+      ] != 1
+    then
+      throw "hooks.nix: hook '${name}' must declare exactly one of lane/standalone/finalize"
+    else if h ? lane && !(h ? order) then
+      throw "hooks.nix: laned hook '${name}' must declare an order"
+    else
+      true;
 
   # Build the `pre-commit` settings block from the enabled hook names.
   mkPreCommit =
@@ -56,33 +68,27 @@ let
           name = laneName;
           group = {
             piped = true;
-            jobs = concatMap (h: map renderJob h.jobs) inLane;
+            jobs = concatMap (h: h.jobs) inLane;
           };
         };
 
-      laneJobs = map laneGroup laneNames;
-      standaloneJobs = concatMap (h: map renderJob h.jobs) standalone;
-      finalizeJobs = concatMap (h: map renderJob h.jobs) finalize;
-
-      mainJob = {
-        name = "main";
-        group = {
-          parallel = true;
-          jobs = laneJobs ++ standaloneJobs;
-        };
-      };
-
-      finalizeJob = {
-        name = "finalize";
-        group = {
-          parallel = true;
-          jobs = finalizeJobs;
-        };
-      };
+      mainJobs = map laneGroup laneNames ++ concatMap (h: h.jobs) standalone;
+      finalizeJobs = concatMap (h: h.jobs) finalize;
     in
     {
       piped = true;
-      jobs = [ mainJob ] ++ optional (finalizeJobs != [ ]) finalizeJob;
+      # `main` is omitted when empty (e.g. only auto-commit enabled): lefthook
+      # errors out on a group with no jobs. Finalize jobs follow it directly,
+      # sequenced by the top-level `piped`.
+      jobs =
+        optional (mainJobs != [ ]) {
+          name = "main";
+          group = {
+            parallel = true;
+            jobs = mainJobs;
+          };
+        }
+        ++ finalizeJobs;
     };
 
   module =
@@ -118,39 +124,74 @@ let
           enabledNames = filter (name: config.hooks.${name}.enable) (attrNames hooks);
           enabledHooks = map (name: hooks.${name}) enabledNames;
           tools = concatMap (h: h.tools) enabledHooks;
-          configFile = (pkgs.formats.yaml { }).generate "lefthook-generated.yml" {
+          rawConfig = (pkgs.formats.yaml { }).generate "lefthook-generated-raw.yml" {
+            min_version = pkgs.lefthook.version;
             pre-commit = mkPreCommit enabledNames;
           };
+          # Rendered through yamlfmt so the committed file is already canonical
+          # for the format-yaml hook — otherwise every commit staging it would
+          # reformat it away from what this flake regenerates.
+          configFile = pkgs.runCommand "lefthook-generated.yml" { nativeBuildInputs = [ pkgs.yamlfmt ]; } ''
+            install -m 644 ${rawConfig} "$out"
+            yamlfmt "$out"
+          '';
         in
+        assert builtins.all (name: validHook name hooks.${name}) (attrNames hooks);
         pkgs.mkShell {
-          buildInputs = tools ++ [ pkgs.lefthook ];
+          # No bare git here: it would land on the interactive PATH and shadow a
+          # user's wrapped git (one exporting GIT_CONFIG_GLOBAL for identity),
+          # breaking `git commit` from inside the shell. The shellHook gets its
+          # own git via an absolute store path instead.
+          packages = tools ++ [ pkgs.lefthook ];
           # Exposed so the rendered config can be built and inspected directly:
           #   nix build .#devShells.<system>.default.lefthookConfig
           passthru.lefthookConfig = configFile;
           shellHook = ''
+            # Give the hook-install steps below a guaranteed git via an absolute
+            # store path, WITHOUT putting a bare git on the interactive PATH
+            # (that would shadow a user's wrapped git and break `git commit`).
+            # The subshell keeps this PATH change from leaking to the shell.
+            (
+            export PATH=${pkgs.git}/bin:$PATH
             if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
               project_root=$(git rev-parse --show-toplevel)
 
-              # Link the generated config into the repo (machine-local, git-ignored).
-              ln -sfn ${configFile} "$project_root/.lefthook-generated.yml"
+              # Materialize the rendered config as a plain file, meant to be
+              # committed: hooks then work from `git checkout` onward, with no
+              # dependency on this machine's Nix store surviving GC.
+              if ! cmp -s ${configFile} "$project_root/lefthook-generated.yml"; then
+                cp -f ${configFile} "$project_root/lefthook-generated.yml"
+                chmod 644 "$project_root/lefthook-generated.yml"
+              fi
 
-              # Belt-and-suspenders: keep generated/local files out of the index
-              # even in repos that don't list them in a tracked .gitignore.
+              # Migration: drop the git-ignored symlink older versions left.
+              if [ -L "$project_root/.lefthook-generated.yml" ]; then
+                rm -f "$project_root/.lefthook-generated.yml"
+              fi
+
+              # lefthook merges lefthook-local.yml automatically; keep the
+              # per-user override out of the index even in repos that don't
+              # list it in a tracked .gitignore.
               exclude=$(git rev-parse --git-path info/exclude)
               mkdir -p "$(dirname "$exclude")"
-              for pat in .lefthook-generated.yml lefthook.local.yml; do
-                grep -qxF "$pat" "$exclude" 2>/dev/null || printf '%s\n' "$pat" >>"$exclude"
-              done
+              grep -qxF lefthook-local.yml "$exclude" 2>/dev/null \
+                || printf 'lefthook-local.yml\n' >>"$exclude"
 
-              # Seed a root config only if the consumer doesn't already have one.
-              # lefthook.local.yml is left untouched for the user's own overrides.
-              [ -f "$project_root/lefthook.yml" ] \
-                || printf 'extends:\n  - .lefthook-generated.yml\n' >"$project_root/lefthook.yml"
+              # Seed a root config only if the consumer doesn't have one; warn
+              # when an existing one silently ignores the generated config.
+              if [ -f "$project_root/lefthook.yml" ]; then
+                if ! grep -Eq '(^|[^.])lefthook-generated\.yml' "$project_root/lefthook.yml"; then
+                  echo "lefthook: warning: lefthook.yml does not extend lefthook-generated.yml; generated hooks are inactive" >&2
+                fi
+              else
+                printf 'extends:\n  - lefthook-generated.yml\n' >"$project_root/lefthook.yml"
+              fi
 
               ( cd "$project_root" && lefthook install >/dev/null )
             else
               echo "lefthook: not inside a git work tree; skipping hook install" >&2
             fi
+            )
           '';
         };
     };
