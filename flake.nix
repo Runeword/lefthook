@@ -26,7 +26,7 @@
         { pkgs, lib, ... }:
         import ./mk-shell.nix {
           inherit pkgs lib;
-          hooks = import ./hooks.nix { inherit pkgs lib; };
+          hooks = import ./hooks.nix { inherit pkgs; };
         }
       );
 
@@ -41,9 +41,39 @@
               lint-shell.enable = true;
               format-toml.enable = true;
               format-yaml.enable = true;
+              security-gitleaks.enable = true;
               auto-commit.enable = true;
             };
           };
+        }
+      );
+
+      checks = forAllSystems (
+        { system, pkgs, ... }:
+        {
+          lefthook-config =
+            let
+              rendered = self.devShells.${system}.default.lefthookConfig;
+            in
+            pkgs.runCommand "check-lefthook-config"
+              {
+                nativeBuildInputs = [
+                  pkgs.git
+                  pkgs.lefthook
+                ];
+              }
+              ''
+                # The committed copy must match what the flake renders.
+                cmp ${./lefthook-generated.yml} ${rendered}
+
+                # lefthook must be able to load the rendered config.
+                export HOME="$TMPDIR"
+                cd "$TMPDIR"
+                git init -q
+                cp ${rendered} lefthook.yml
+                lefthook dump >/dev/null
+                touch "$out"
+              '';
         }
       );
     };
