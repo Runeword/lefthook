@@ -1,8 +1,0 @@
-pre-commit:
-  jobs:
-    - name: main
-      group:
-        parallel: true
-        jobs:
-          - name: security-gitleaks
-            run: security-gitleaks
