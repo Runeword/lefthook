@@ -5,22 +5,25 @@
 #              a lane are piped in `order` (format = 0 -> lint = 1 -> security = 2).
 #   standalone repo-wide job with no lane (e.g. gitleaks), run under `main`.
 #   finalize   runs after `main` succeeds (auto-commit).
-#   tools      packages placed on the dev-shell PATH for interactive use.
-#   jobs       one or more lefthook jobs. `run` uses absolute store paths
-#              (lib.getExe') so the generated config works even when git is
-#              invoked from outside the dev shell (GUI clients, bare terminals).
-#   stageFixed re-stage files the job rewrote (formatters), via lefthook's
-#              native `stage_fixed`.
-{ pkgs, lib }:
+#   tools      packages placed on the dev-shell PATH. `run` commands call them
+#              by bare name, so the generated config is machine-independent and
+#              meant to be committed; a commit made outside the dev shell fails
+#              loudly (command not found) instead of running stale tools.
+#   jobs       one or more verbatim lefthook job attrsets (name, run, glob,
+#              stage_fixed, skip, ...), rendered into the config as-is.
+{ pkgs }:
 let
-  inherit (lib) getExe';
-
   # Hooks with real logic keep a wrapper script (strict bash, pinned runtime
   # deps, shellcheck at build time). Passthrough one-liners are inlined below.
   autoCommit = pkgs.writeShellApplication {
     name = "auto-commit";
     runtimeInputs = [ pkgs.git ];
     text = builtins.readFile ./scripts/auto-commit.sh;
+  };
+  lintGo = pkgs.writeShellApplication {
+    name = "lint-go";
+    runtimeInputs = [ pkgs.golangci-lint ];
+    text = builtins.readFile ./scripts/lint-go.sh;
   };
   lintNix = pkgs.writeShellApplication {
     name = "lint-nix";
@@ -45,8 +48,8 @@ in
       {
         name = "format-go";
         glob = "*.go";
-        stageFixed = true;
-        run = "${getExe' pkgs.gofumpt "gofumpt"} -w {staged_files}";
+        stage_fixed = true;
+        run = "gofumpt -w {staged_files}";
       }
     ];
   };
@@ -54,12 +57,15 @@ in
   lint-go = {
     lane = "go";
     order = 1;
-    tools = [ pkgs.golangci-lint ];
+    tools = [
+      pkgs.golangci-lint
+      lintGo
+    ];
     jobs = [
       {
         name = "lint-go";
         glob = "*.go";
-        run = "${getExe' pkgs.golangci-lint "golangci-lint"} run";
+        run = "lint-go {staged_files}";
       }
     ];
   };
@@ -72,8 +78,8 @@ in
       {
         name = "format-lua";
         glob = "*.lua";
-        stageFixed = true;
-        run = "${getExe' pkgs.stylua "stylua"} {staged_files}";
+        stage_fixed = true;
+        run = "stylua {staged_files}";
       }
     ];
   };
@@ -86,8 +92,8 @@ in
       {
         name = "format-nix";
         glob = "*.nix";
-        stageFixed = true;
-        run = "${getExe' pkgs.nixfmt "nixfmt"} {staged_files}";
+        stage_fixed = true;
+        run = "nixfmt {staged_files}";
       }
     ];
   };
@@ -98,12 +104,13 @@ in
     tools = [
       pkgs.deadnix
       pkgs.statix
+      lintNix
     ];
     jobs = [
       {
         name = "lint-nix";
         glob = "*.nix";
-        run = "${getExe' lintNix "lint-nix"} {staged_files}";
+        run = "lint-nix {staged_files}";
       }
     ];
   };
@@ -116,8 +123,8 @@ in
       {
         name = "format-opentofu";
         glob = "*.{tf,tofu,tfvars}";
-        stageFixed = true;
-        run = "${getExe' pkgs.opentofu "tofu"} fmt {staged_files}";
+        stage_fixed = true;
+        run = "tofu fmt {staged_files}";
       }
     ];
   };
@@ -125,12 +132,15 @@ in
   lint-opentofu = {
     lane = "opentofu";
     order = 1;
-    tools = [ pkgs.tflint ];
+    tools = [
+      pkgs.tflint
+      lintOpentofu
+    ];
     jobs = [
       {
         name = "lint-opentofu";
         glob = "*.{tf,tofu}";
-        run = getExe' lintOpentofu "lint-opentofu";
+        run = "lint-opentofu {staged_files}";
       }
     ];
   };
@@ -143,7 +153,7 @@ in
       {
         name = "security-opentofu";
         glob = "*.{tf,tofu,tfvars}";
-        run = "${getExe' pkgs.trivy "trivy"} config --quiet --exit-code 1 {staged_files}";
+        run = "trivy config --quiet --exit-code 1 {staged_files}";
       }
     ];
   };
@@ -156,8 +166,8 @@ in
       {
         name = "format-rust";
         glob = "*.rs";
-        stageFixed = true;
-        run = "${getExe' pkgs.rustfmt "rustfmt"} {staged_files}";
+        stage_fixed = true;
+        run = "rustfmt {staged_files}";
       }
     ];
   };
@@ -176,14 +186,14 @@ in
       {
         name = "shfmt";
         glob = "*.sh";
-        stageFixed = true;
-        run = "${getExe' pkgs.shfmt "shfmt"} --write --indent 2 --case-indent --language-dialect posix --simplify {staged_files}";
+        stage_fixed = true;
+        run = "shfmt --write --indent 2 --case-indent --language-dialect posix --simplify {staged_files}";
       }
       {
         name = "shellharden";
         glob = "*.sh";
-        stageFixed = true;
-        run = "${getExe' pkgs.shellharden "shellharden"} --replace {staged_files}";
+        stage_fixed = true;
+        run = "shellharden --replace {staged_files}";
       }
     ];
   };
@@ -196,7 +206,7 @@ in
       {
         name = "lint-shell";
         glob = "*.sh";
-        run = "${getExe' pkgs.shellcheck "shellcheck"} {staged_files}";
+        run = "shellcheck {staged_files}";
       }
     ];
   };
@@ -209,8 +219,8 @@ in
       {
         name = "format-toml";
         glob = "*.toml";
-        stageFixed = true;
-        run = "RUST_LOG=warn ${getExe' pkgs.taplo "taplo"} format {staged_files}";
+        stage_fixed = true;
+        run = "RUST_LOG=warn taplo format {staged_files}";
       }
     ];
   };
@@ -223,8 +233,8 @@ in
       {
         name = "format-yaml";
         glob = "*.{yml,yaml}";
-        stageFixed = true;
-        run = "${getExe' pkgs.yamlfmt "yamlfmt"} {staged_files}";
+        stage_fixed = true;
+        run = "yamlfmt {staged_files}";
       }
     ];
   };
@@ -237,8 +247,8 @@ in
       {
         name = "format-zig";
         glob = "*.{zig,zon}";
-        stageFixed = true;
-        run = "${getExe' pkgs.zig "zig"} fmt {staged_files}";
+        stage_fixed = true;
+        run = "zig fmt {staged_files}";
       }
     ];
   };
@@ -249,21 +259,27 @@ in
     jobs = [
       {
         name = "security-gitleaks";
-        run = "${getExe' pkgs.gitleaks "gitleaks"} git --pre-commit --redact --staged --verbose --no-banner --log-level=warn";
+        run = "gitleaks git --pre-commit --redact --staged --verbose --no-banner --log-level=warn";
       }
     ];
   };
 
   auto-commit = {
     finalize = true;
-    # No interactive tool: keep the user's own `git` first on PATH so a wrapped
-    # git (e.g. one exporting GIT_CONFIG_GLOBAL) isn't shadowed by a bare
-    # pkgs.git. The auto-commit script bakes in its own git via runtimeInputs.
-    tools = [ ];
+    # Only the wrapper (its `run` is the bare name `auto-commit`). NOT pkgs.git:
+    # a bare git on the dev-shell PATH shadows a user's wrapped git (one
+    # exporting GIT_CONFIG_GLOBAL for identity), breaking `git commit` from the
+    # shell. The script bakes in its own git via runtimeInputs.
+    tools = [ autoCommit ];
     jobs = [
       {
         name = "auto-commit";
-        run = getExe' autoCommit "auto-commit";
+        run = "auto-commit";
+        # Redundant with the script's own passthrough guards, on purpose.
+        skip = [
+          "merge"
+          "rebase"
+        ];
       }
     ];
   };
