@@ -1,12 +1,29 @@
-# Lefthook remote configs
+# Lefthook Nix flake
 
-A collection of reusable [Lefthook](https://github.com/evilmartians/lefthook) hooks distributed as a Nix flake.
+Reusable [Lefthook](https://github.com/evilmartians/lefthook) pre-commit hooks
+for a Nix dev shell. Enable the hooks you want; the flake renders them into a
+single generated lefthook config with the ordering baked in.
 
-The flake exposes:
+## How it works
 
-- `packages.<system>.<hook>` — wrapper binaries (e.g. `format-nix`, `lint-go`, `auto-commit`)
-- `precommit-<hook>.yml` files in the flake source — lefthook YAML fragments (the filename matches each wrapper's name)
-- `lib.<system>.mkShell { hooks }` — module-style factory. `hooks` is an attrset where each known hook can be enabled with `<name>.enable = true`. Returns a `pkgs.mkShell` derivation with the enabled binaries plus `pkgs.lefthook` on PATH and a `shellHook` that generates `lefthook.local.yml`, ensures `lefthook.yml` exists, and runs `lefthook install`. Drop it into your own shell's `inputsFrom`. Unknown hook names error at evaluation with a "Did you mean…?" suggestion (NixOS-module style, à la [cachix/git-hooks.nix](https://github.com/cachix/git-hooks.nix) and [numtide/treefmt-nix](https://github.com/numtide/treefmt-nix)).
+`lib.<system>.mkShell { hooks = { … }; }` is the only public entry point.
+`hooks` is an attrset where each known hook is toggled with `<name>.enable =
+true`. It returns a `pkgs.mkShell` derivation to drop into your own shell's
+`inputsFrom`. On shell entry it:
+
+- puts the enabled tools plus `pkgs.lefthook` on `PATH`;
+- renders one lefthook config (via `pkgs.formats.yaml`) and symlinks it into the
+  project root as `.lefthook-generated.yml` (git-ignored);
+- creates `lefthook.yml` if absent so it `extends` the generated file, then runs
+  `lefthook install`.
+
+Every hook's `run:` command is an absolute `/nix/store` path, so hooks keep
+working when you commit from outside the dev shell (GUI clients, bare
+terminals). Unknown hook names fail at evaluation with a NixOS-module-style
+"Did you mean…?" suggestion.
+
+`lefthook.local.yml` is left entirely to you — it is lefthook's own per-user
+override file and is merged automatically.
 
 ## Installation
 
@@ -16,7 +33,7 @@ Add as a flake input:
 inputs.lefthook.url = "github:Runeword/lefthook";
 ```
 
-Then in your devShell:
+Then in your dev shell:
 
 ```nix
 { lefthook, pkgs, ... }:
@@ -24,7 +41,7 @@ pkgs.mkShell {
   inputsFrom = [
     (lefthook.lib.${pkgs.system}.mkShell {
       hooks = {
-        # per-language: format → lint → security
+        # per language: format → lint → security
         format-nix.enable        = true;
         lint-nix.enable          = true;
         format-shell.enable      = true;
@@ -38,44 +55,59 @@ pkgs.mkShell {
 }
 ```
 
-Each `<name>.enable = true` selects a hook from `lefthook.packages.<system>` (binary + matching YAML fragment, bundled via `passthru.lefthookFragment`). `mkShell` puts the enabled binaries on PATH, generates `lefthook.local.yml` extending the matching fragments, and runs `lefthook install`. `pkgs.lefthook` is injected automatically.
+If you already have a `lefthook.yml` (for `pre-push` jobs, say), add the
+generated file to its `extends:` list yourself:
 
-## Ordering
+```yaml
+extends:
+  - .lefthook-generated.yml
+```
 
-Lefthook merges `extends:` fragments by job name. List hooks as `format-<lang> → lint-<lang> → security-<lang>` within each language, and put `auto-commit` last. Lefthook auto-parallelizes language lanes; piped jobs within a lane stop on first failure.
+## Ordering (enforced, not by convention)
+
+Hooks are grouped into per-language **lanes** that run in parallel under a
+`main` job. Within a lane, jobs are **piped** in `format → lint → security`
+order and stop on first failure. `auto-commit` runs afterwards in a `finalize`
+job, and `pre-commit` itself is piped — so a failing formatter or linter blocks
+`auto-commit` entirely. Formatters carry `stage_fixed`, so fixes are re-staged
+before anything is committed.
+
+All of this is derived from data in `hooks.nix`, so the order is fixed and
+cannot drift with how the attrset happens to be enumerated.
 
 ## Available hooks
 
-Each hook ships a wrapper binary and a YAML fragment with the same name.
+| Lane       | Hooks                                                     |
+| ---------- | -------------------------------------------------------- |
+| `go`       | `format-go`, `lint-go`                                    |
+| `lua`      | `format-lua`                                              |
+| `nix`      | `format-nix`, `lint-nix`                                  |
+| `opentofu` | `format-opentofu`, `lint-opentofu`, `security-opentofu`  |
+| `rust`     | `format-rust`                                             |
+| `shell`    | `format-shell` (shfmt + shellharden), `lint-shell`       |
+| `toml`     | `format-toml`                                             |
+| `yaml`     | `format-yaml`                                             |
+| `zig`      | `format-zig`                                              |
+| —          | `security-gitleaks` (repo-wide), `auto-commit` (finalize) |
 
-| Hook                 | YAML file                            |
-| -------------------- | ------------------------------------ |
-| `auto-commit`        | `precommit-auto-commit.yml`          |
-| `format-go`          | `precommit-format-go.yml`            |
-| `format-lua`         | `precommit-format-lua.yml`           |
-| `format-nix`         | `precommit-format-nix.yml`           |
-| `format-opentofu`    | `precommit-format-opentofu.yml`      |
-| `format-rust`        | `precommit-format-rust.yml`          |
-| `format-shell`       | `precommit-format-shell.yml`         |
-| `format-toml`        | `precommit-format-toml.yml`          |
-| `format-yaml`        | `precommit-format-yaml.yml`          |
-| `format-zig`         | `precommit-format-zig.yml`           |
-| `lint-go`            | `precommit-lint-go.yml`              |
-| `lint-nix`           | `precommit-lint-nix.yml`             |
-| `lint-opentofu`      | `precommit-lint-opentofu.yml`        |
-| `lint-shell`         | `precommit-lint-shell.yml`           |
-| `security-gitleaks`  | `precommit-security-gitleaks.yml`    |
-| `security-opentofu`  | `precommit-security-opentofu.yml`    |
+## auto-commit
 
-## Remote configs (without Nix)
+Splits one `git commit` into one commit per staged file, each with a generated
+`Add/Update/Delete <file>` message, then aborts the umbrella commit.
 
-Alternatively, reference the YAML files directly via lefthook's own `remotes:`. Tools must be on PATH already in this mode.
+Two consequences worth knowing:
 
-```yaml
-remotes:
-  - git_url: https://github.com/Runeword/lefthook
-    configs:
-      - precommit-format-nix.yml
-      - precommit-lint-nix.yml
-      - precommit-auto-commit.yml
-```
+- **`git commit` always exits non-zero, even on success** — its files have
+  already been committed individually, so the original commit is cancelled.
+- Each file is committed from its **staged** blob, so partial staging
+  (`git add -p`) is preserved: unstaged hunks stay in the working tree.
+
+Enable it last.
+
+## Adding a hook
+
+Add an entry to `hooks.nix`: give it a `lane` + `order` (or `standalone` /
+`finalize`), the `tools` it needs on `PATH`, and one or more `jobs` whose `run`
+is built from `lib.getExe'`. Formatters should set `stageFixed = true`. That is
+the only file to touch — `mk-shell.nix` renders it and the module exposes the
+`<name>.enable` option automatically.
