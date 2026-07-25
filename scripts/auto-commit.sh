@@ -16,6 +16,24 @@ if [ "${AUTO_COMMIT:-}" = "1" ]; then
   exit 0
 fi
 
+# A merge, cherry-pick, revert, or rebase in progress must conclude as the
+# single commit git expects: the first per-file commit below would consume its
+# state (e.g. MERGE_HEAD) and record a history that never happened.
+git_dir=$(git rev-parse --git-dir)
+for state in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD rebase-merge rebase-apply; do
+  if [ -e "$git_dir/$state" ]; then
+    exit 0
+  fi
+done
+
+# "git commit -a" and pathspec commits run the hook against a temporary index
+# (a *.lock path) that git discards when the umbrella commit aborts; splitting
+# from it leaves the real index stale, and the next commit would silently
+# revert the split commits.
+case ${GIT_INDEX_FILE:-} in
+  *.lock) exit 0 ;;
+esac
+
 # Nothing staged: let the normal commit path handle it.
 if git diff --cached --quiet; then
   exit 0
