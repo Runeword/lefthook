@@ -1,2 +1,2 @@
 extends:
-  - .lefthook-generated.yml
+  - lefthook-generated.yml
