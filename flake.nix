@@ -30,6 +30,11 @@
         }
       );
 
+      # The wrapper scripts, exposed so a consumer without a dev shell (e.g. a
+      # bare dotfiles repo committing from a plain terminal) can install them
+      # globally and resolve the generated config's bare `run` names.
+      packages = forAllSystems ({ pkgs, ... }: import ./wrappers.nix { inherit pkgs; });
+
       devShells = forAllSystems (
         { system, ... }:
         {
