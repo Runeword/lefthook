@@ -30,10 +30,40 @@
         }
       );
 
-      # The wrapper scripts, exposed so a consumer without a dev shell (e.g. a
-      # bare dotfiles repo committing from a plain terminal) can install them
-      # globally and resolve the generated config's bare `run` names.
-      packages = forAllSystems ({ pkgs, ... }: import ./wrappers.nix { inherit pkgs; });
+      # The wrapper scripts, exposed so a repository that commits without
+      # entering a dev shell can install them globally and resolve the
+      # generated config's bare `run` names. Plus `lefthook-init`, the
+      # one-command scaffolder.
+      packages = forAllSystems (
+        { pkgs, system, ... }:
+        import ./wrappers.nix { inherit pkgs; }
+        // {
+          lefthook-init = import ./init.nix {
+            inherit
+              pkgs
+              self
+              system
+              nixpkgs
+              ;
+          };
+        }
+      );
+
+      # `nix run github:Runeword/lefthook` scaffolds the current repository.
+      apps = forAllSystems (
+        { system, ... }:
+        let
+          init = {
+            type = "app";
+            program = "${self.packages.${system}.lefthook-init}/bin/lefthook-init";
+            meta.description = "Scaffold lefthook into the current git repository";
+          };
+        in
+        {
+          inherit init;
+          default = init;
+        }
+      );
 
       devShells = forAllSystems (
         { system, ... }:
