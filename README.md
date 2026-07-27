@@ -30,33 +30,82 @@ with a NixOS-module-style "Did you mean…?" suggestion.
 override file and is merged automatically. Shell entry adds it to
 `.git/info/exclude` so it can't be committed by accident.
 
-## Installation
+## Quick setup (no flake input needed)
 
-Add as a flake input:
+In any git repository:
+
+```sh
+nix run github:Runeword/lefthook
+```
+
+That detects which languages the repository contains, renders the matching
+config, writes `lefthook-generated.yml` + `lefthook.yml`, installs the git
+hooks and stages both files — commit them and you are done. The repository
+needs no flake input, no dev shell and no direnv; the config's `min_version`
+is stamped from the lefthook already on your `PATH`.
+
+Detection is overridable:
+
+```sh
+nix run github:Runeword/lefthook -- --lanes nix,shell --no-auto-commit
+```
+
+The only requirement is that the tools the config names are on `PATH` when you
+commit — either from a dev shell (below) or installed globally.
+
+### Installing the tools globally
+
+`lib.<system>.toolchain` takes the same arguments as `mkShell` and returns the
+packages those hooks need, including `lefthook` itself. Derived from
+`hooks.nix`, so it cannot drift from the generated config the way a
+hand-written list does:
+
+```nix
+# home-manager
+home.packages = [ … ] ++ inputs.lefthook.lib.${pkgs.system}.toolchain {
+  lanes = [ "nix" "shell" "toml" "yaml" ];
+  gitleaks = true;
+  autoCommit = true;
+};
+```
+
+Do that once per machine and every repository whose lanes it covers is a
+one-command setup. Adding a language later means adding a lane here and
+re-running `home-manager switch` — not editing each repository.
+
+The wrapper scripts are also exposed individually as
+`packages.<system>.{auto-commit,lint-nix,lint-go,lint-opentofu}`.
+
+## Installation as a flake input
+
+Use this instead when you want the toolchain pinned per repository.
 
 ```nix
 inputs.lefthook.url = "github:Runeword/lefthook";
 ```
 
-Then in your dev shell:
+Then in your dev shell — `lanes` enables every hook in a language lane:
 
 ```nix
 { lefthook, pkgs, ... }:
 pkgs.mkShell {
   inputsFrom = [
     (lefthook.lib.${pkgs.system}.mkShell {
-      hooks = {
-        # per language: format → lint → security
-        format-nix.enable        = true;
-        lint-nix.enable          = true;
-        format-shell.enable      = true;
-        lint-shell.enable        = true;
-        security-gitleaks.enable = true;
-        # commit-message automation
-        auto-commit.enable       = true;
-      };
+      lanes = [ "nix" "shell" ];   # format → lint → security, per lane
+      gitleaks = true;
+      autoCommit = true;
     })
   ];
+}
+```
+
+`hooks.<name>.enable` is still available for finer control, and always wins
+over what a lane implies:
+
+```nix
+lefthook.lib.${pkgs.system}.mkShell {
+  lanes = [ "nix" ];
+  hooks.lint-nix.enable = false;   # lane minus one hook
 }
 ```
 
@@ -137,6 +186,19 @@ Consequences worth knowing:
   one normal commit: concluding a merge, cherry-pick, revert, or rebase, and
   `git commit -a` / pathspec commits (git runs those against a temporary
   index).
+
+## Regenerating
+
+The generated config is a committed artifact, so it has to be refreshed when
+the hook set or this flake changes:
+
+- **dev-shell repos** — re-enter the shell (`direnv reload`); the shellHook
+  rewrites the file whenever it differs, and warns if `lefthook.yml` stops
+  referencing it.
+- **scaffolded repos** — re-run `nix run github:Runeword/lefthook -- --force`.
+
+Both paths render through the same module, so a scaffolded repository and one
+wired via `lib.mkShell` with the same hooks produce byte-identical output.
 
 ## Adding a hook
 
