@@ -14,30 +14,9 @@
 { pkgs }:
 let
   # Hooks with real logic keep a wrapper script (strict bash, pinned runtime
-  # deps, shellcheck at build time). Passthrough one-liners are inlined below.
-  autoCommit = pkgs.writeShellApplication {
-    name = "auto-commit";
-    runtimeInputs = [ pkgs.git ];
-    text = builtins.readFile ./scripts/auto-commit.sh;
-  };
-  lintGo = pkgs.writeShellApplication {
-    name = "lint-go";
-    runtimeInputs = [ pkgs.golangci-lint ];
-    text = builtins.readFile ./scripts/lint-go.sh;
-  };
-  lintNix = pkgs.writeShellApplication {
-    name = "lint-nix";
-    runtimeInputs = [
-      pkgs.deadnix
-      pkgs.statix
-    ];
-    text = builtins.readFile ./scripts/lint-nix.sh;
-  };
-  lintOpentofu = pkgs.writeShellApplication {
-    name = "lint-opentofu";
-    runtimeInputs = [ pkgs.tflint ];
-    text = builtins.readFile ./scripts/lint-opentofu.sh;
-  };
+  # deps, shellcheck at build time). Defined in wrappers.nix so flake.nix can
+  # also expose them as packages. Passthrough one-liners are inlined below.
+  wrappers = import ./wrappers.nix { inherit pkgs; };
 in
 {
   format-go = {
@@ -59,7 +38,7 @@ in
     order = 1;
     tools = [
       pkgs.golangci-lint
-      lintGo
+      wrappers.lint-go
     ];
     jobs = [
       {
@@ -104,7 +83,7 @@ in
     tools = [
       pkgs.deadnix
       pkgs.statix
-      lintNix
+      wrappers.lint-nix
     ];
     jobs = [
       {
@@ -134,7 +113,7 @@ in
     order = 1;
     tools = [
       pkgs.tflint
-      lintOpentofu
+      wrappers.lint-opentofu
     ];
     jobs = [
       {
@@ -270,7 +249,7 @@ in
     # a bare git on the dev-shell PATH shadows a user's wrapped git (one
     # exporting GIT_CONFIG_GLOBAL for identity), breaking `git commit` from the
     # shell. The script bakes in its own git via runtimeInputs.
-    tools = [ autoCommit ];
+    tools = [ wrappers.auto-commit ];
     jobs = [
       {
         name = "auto-commit";
