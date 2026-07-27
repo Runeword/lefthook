@@ -1,8 +1,9 @@
 # Wrapper scripts for hooks with real shell logic: strict bash, pinned runtime
 # deps, shellcheck at build time. Imported by hooks.nix (to place them on the
 # dev-shell PATH under their bare names) and by flake.nix (exposed as
-# `packages.<system>.<name>` so non-dev-shell consumers — e.g. a bare dotfiles
-# repo — can install them globally and still resolve the config's bare names).
+# `packages.<system>.<name>`, so a repository that commits without entering a
+# dev shell can install them globally and still resolve the config's bare
+# names).
 { pkgs }:
 {
   auto-commit = pkgs.writeShellApplication {
