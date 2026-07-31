@@ -11,6 +11,13 @@
 #              loudly (command not found) instead of running stale tools.
 #   jobs       one or more verbatim lefthook job attrsets (name, run, glob,
 #              stage_fixed, skip, ...), rendered into the config as-is.
+#
+# `run` puts `--` before {staged_files} so a file named like a flag stays a
+# file. Two deliberate exceptions: `zig fmt` rejects `--`, and the wrapper
+# scripts below (lint-*, security-opentofu) would see it as their own first
+# argument — they add `--` when they call the real tool instead. Note also that {staged_files} must stay
+# UNQUOTED: lefthook shell-escapes each path, and wrapping it in quotes of your
+# own undoes that and reopens command injection.
 { pkgs }:
 let
   # Hooks with real logic keep a wrapper script (strict bash, pinned runtime
@@ -28,7 +35,7 @@ in
         name = "format-go";
         glob = "*.go";
         stage_fixed = true;
-        run = "gofumpt -w {staged_files}";
+        run = "gofumpt -w -- {staged_files}";
       }
     ];
   };
@@ -58,7 +65,7 @@ in
         name = "format-lua";
         glob = "*.lua";
         stage_fixed = true;
-        run = "stylua {staged_files}";
+        run = "stylua -- {staged_files}";
       }
     ];
   };
@@ -72,7 +79,7 @@ in
         name = "format-nix";
         glob = "*.nix";
         stage_fixed = true;
-        run = "nixfmt {staged_files}";
+        run = "nixfmt -- {staged_files}";
       }
     ];
   };
@@ -103,7 +110,7 @@ in
         name = "format-opentofu";
         glob = "*.{tf,tofu,tfvars}";
         stage_fixed = true;
-        run = "tofu fmt {staged_files}";
+        run = "tofu fmt -- {staged_files}";
       }
     ];
   };
@@ -127,12 +134,15 @@ in
   security-opentofu = {
     lane = "opentofu";
     order = 2;
-    tools = [ pkgs.trivy ];
+    tools = [
+      pkgs.trivy
+      wrappers.security-opentofu
+    ];
     jobs = [
       {
         name = "security-opentofu";
         glob = "*.{tf,tofu,tfvars}";
-        run = "trivy config --quiet --exit-code 1 {staged_files}";
+        run = "security-opentofu {staged_files}";
       }
     ];
   };
@@ -146,7 +156,7 @@ in
         name = "format-rust";
         glob = "*.rs";
         stage_fixed = true;
-        run = "rustfmt {staged_files}";
+        run = "rustfmt -- {staged_files}";
       }
     ];
   };
@@ -154,6 +164,11 @@ in
   # The shell lane pipes two formatters (shfmt, then shellharden) before lint.
   # `--diff` is intentionally dropped from shfmt: it makes shfmt exit non-zero
   # whenever it reformats, which would abort the piped lane before shellharden.
+  # `--language-dialect auto` (not `posix`): shfmt reads the shebang, so a
+  # consumer's `#!/bin/bash` script is formatted as bash while this repo's own
+  # `#!/bin/sh` scripts still get POSIX treatment. Hard-coding `posix` made
+  # shfmt exit 1 on any bash feature (arrays, `[[ ]]`) in a `*.sh` file — the
+  # standard bash extension — so a scaffolded repo could not commit those files.
   format-shell = {
     lane = "shell";
     order = 0;
@@ -166,13 +181,13 @@ in
         name = "shfmt";
         glob = "*.sh";
         stage_fixed = true;
-        run = "shfmt --write --indent 2 --case-indent --language-dialect posix --simplify {staged_files}";
+        run = "shfmt --write --indent 2 --case-indent --language-dialect auto --simplify -- {staged_files}";
       }
       {
         name = "shellharden";
         glob = "*.sh";
         stage_fixed = true;
-        run = "shellharden --replace {staged_files}";
+        run = "shellharden --replace -- {staged_files}";
       }
     ];
   };
@@ -185,7 +200,7 @@ in
       {
         name = "lint-shell";
         glob = "*.sh";
-        run = "shellcheck {staged_files}";
+        run = "shellcheck -- {staged_files}";
       }
     ];
   };
@@ -199,7 +214,7 @@ in
         name = "format-toml";
         glob = "*.toml";
         stage_fixed = true;
-        run = "RUST_LOG=warn taplo format {staged_files}";
+        run = "RUST_LOG=warn taplo format -- {staged_files}";
       }
     ];
   };
@@ -213,7 +228,7 @@ in
         name = "format-yaml";
         glob = "*.{yml,yaml}";
         stage_fixed = true;
-        run = "yamlfmt {staged_files}";
+        run = "yamlfmt -- {staged_files}";
       }
     ];
   };
@@ -232,13 +247,21 @@ in
     ];
   };
 
+  # Scans the staged diff, forced to text with `git diff --cached --text` piped
+  # into `gitleaks stdin`. NOT `gitleaks git --staged`: that reads `git diff`,
+  # which honours `.gitattributes`, so a single `*.env -diff` (or `binary`) line
+  # — landed by a PR, a teammate, or an adopted repo — silently removes those
+  # paths from the scan. `--text` overrides that and cannot be suppressed from
+  # inside the repo. (Trade-off: stdin mode does not consult `.gitleaksignore`,
+  # which this project treats as a feature — a silent allowlist is the same
+  # blind spot.)
   security-gitleaks = {
     standalone = true;
     tools = [ pkgs.gitleaks ];
     jobs = [
       {
         name = "security-gitleaks";
-        run = "gitleaks git --pre-commit --redact --staged --verbose --no-banner --log-level=warn";
+        run = "git diff --cached --text | gitleaks stdin --redact --verbose --no-banner --log-level=warn";
       }
     ];
   };
