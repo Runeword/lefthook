@@ -16,8 +16,10 @@ normal commit instead.
 
 Committing also runs this repo's formatters and linters on the staged files and
 **blocks the commit** if they fail (`nixfmt`, `deadnix`, `statix` for Nix;
-`shfmt --language-dialect posix`, `shellharden`, `shellcheck` for
+`shfmt --language-dialect auto`, `shellharden`, `shellcheck` for
 `scripts/*.sh`). Run them before committing rather than discovering it mid-hook.
+`auto` reads the shebang, so these `#!/bin/sh` scripts are still held to POSIX —
+it exists so a *consumer's* `#!/bin/bash` script is not rejected outright.
 
 ## Commands
 
@@ -26,7 +28,15 @@ nix flake check                                    # eval + the config check bel
 nix build .#checks.x86_64-linux.lefthook-config    # just that check
 nix build .#devShells.x86_64-linux.default.lefthookConfig  # render the config
 nix develop                                        # regenerates lefthook-generated.yml, installs hooks
-nix run .#init -- --lanes nix,shell                # the scaffolder, against this checkout
+
+# Regenerate the committed config WITHOUT entering the shell (which mutates the
+# repo and installs hooks):
+install -m 644 "$(nix build --no-link --print-out-paths \
+  .#devShells.x86_64-linux.default.lefthookConfig)" lefthook-generated.yml
+
+# The scaffolder. Never against this checkout: it would rewrite and `git add`
+# the committed config with whatever lanes you passed. Use a throwaway repo.
+d=$(mktemp -d) && git -C "$d" init -q && (cd "$d" && nix run /home/charles/lefthook#init -- --lanes nix,shell)
 ```
 
 There is no unit-test suite. `checks.lefthook-config` asserts the **committed**
@@ -50,9 +60,19 @@ hooks.nix  ──►  mk-shell.nix  ──►  lefthook-generated.yml (committed
   and `jobs` written as **verbatim lefthook job attrsets** (`name`, `run`,
   `glob`, `stage_fixed`, `skip`, …) emitted into the YAML as-is. Adding a hook
   should touch only this file.
-- **`wrappers.nix`** — the four hooks with real shell logic, built with
+- **`wrappers.nix`** — every script with real shell logic, built with
   `writeShellApplication` (strict bash, pinned `runtimeInputs`, shellcheck at
-  build time). Imported by both `hooks.nix` and `flake.nix`.
+  build time): the `auto-commit`, `lint-*` and `security-opentofu` hooks, plus
+  the non-hook `wire-repo`. Imported by `hooks.nix`, `flake.nix`,
+  `mk-shell.nix` and `init.nix`. `runtimeInputs` must list *every* command the
+  script calls — the ambient `PATH` stays in place, so an omission resolves
+  silently from whatever the commit environment happens to have. Note `cmp` is
+  in **diffutils**, not coreutils.
+- **`scripts/wire-repo.sh`** — the shared "point this repo at a rendered
+  config" step: writes `lefthook-generated.yml`, seeds `lefthook.yml`, keeps
+  `lefthook-local.yml` out of the index, then `lefthook install`. Both the dev
+  shell's `shellHook` and `lefthook-init` call it, so changing either path means
+  changing this file.
 - **`mk-shell.nix`** — an `evalModules` module plus the renderer. Exposes
   `mkShell` (dev shell) and `toolchain` (the packages, for global installs);
   both take the same arguments.
@@ -72,21 +92,57 @@ lane blocks `auto-commit`.
 - **`lefthook-generated.yml` is committed and must match what the flake
   renders.** After changing `hooks.nix` or `mk-shell.nix`, regenerate it
   (`nix develop` / `direnv reload`) or `nix flake check` fails on the `cmp`.
-- **`min_version` must describe the lefthook that will *run* the hook**, not
-  the one that rendered the config. It defaults to `pkgs.lefthook.version`;
-  `lefthook-init` overrides it with the runner found on `PATH`. A config
-  demanding a newer lefthook than the runner fails hard at commit time — this
-  has bitten repeatedly when a consumer's nixpkgs is older than this flake's.
+- **`min_version` must not exceed the lefthook that will *run* the hook.** A
+  config demanding a newer lefthook than the runner fails hard at commit time —
+  this has bitten repeatedly when a consumer's nixpkgs is older than this
+  flake's. It defaults to `featureFloor` (a true lower bound every supported
+  runner meets), **not** `pkgs.lefthook.version`, which would ratchet the demand
+  up on every `nix flake update`; `lefthook-init` overrides it with the runner
+  found on `PATH`. `mk-shell.nix` asserts `>= featureFloor` on render, so an
+  explicit too-low value throws. The floor is **1.13.0**: `jobs:` needs 1.10.0,
+  but below 1.13.0 the parallel lanes' post-format `git add` calls race
+  `.git/index.lock` and `stage_fixed` silently drops the reformatted blobs (a
+  warning, exit 0); older still, the runner ignores every job and exits 0. Both
+  leave the repo looking hooked while checking nothing. `scripts/init.sh`
+  enforces the same floor on the runner.
+- **`{staged_files}` stays unquoted in `run`.** lefthook shell-escapes each
+  path before substituting; wrapping it in quotes of your own strips that
+  escaping and turns a filename like `$(…).nix` into command injection. Put
+  `--` before it instead, so a file named like a flag stays a file — except
+  for `zig fmt`, which rejects `--`, and the `lint-*` wrappers, which would
+  receive it as their own first argument.
 - **`lanes` is all-or-nothing per lane**; opt a hook out with
   `hooks.<name>.enable = false`, which wins over what a lane implies.
 - **`scripts/*.sh` need `#!/bin/sh`** even though `writeShellApplication`
   supplies its own shebang and the line is inert — without it shellcheck
-  fails with SC2148. Keep them POSIX-clean so the repo's own `shfmt --language-dialect posix`
-  and `shellcheck` pass.
+  fails with SC2148. Keep them POSIX-clean: the shebang is what makes
+  `shfmt --language-dialect auto` hold them to POSIX, so the repo's own hook and
+  `shellcheck` pass.
+- **They are written for `sh` but *run* under bash with `set -euo pipefail`.**
+  That gap is where the bugs live, not in syntax. Two that bit:
+  `cmd | grep -q pat` reads as *false* on a large input, because grep exits at
+  the first match, the writer dies of SIGPIPE and `pipefail` propagates it —
+  use `grep pat >/dev/null`, which reads to EOF. And a bare `dirname "$f"`
+  failing on an odd filename aborts the whole pipeline rather than that one
+  iteration.
+- **shellharden rewrites two constructs into something else.** `for x in $list`
+  becomes `for x in "$list"` (one iteration, SC2066) or a bash array; and it
+  inserts literal quote characters *inside* heredoc bodies. Iterate by
+  consuming a string with `${v%% *}` / `${v#* }` instead — see the probe loop
+  in `scripts/init.sh`. Always re-run the repo's exact
+  `shfmt --indent 2 --case-indent --language-dialect auto --simplify`,
+  `shellharden --replace` and `shellcheck` after editing, in that order.
+- **`auto-commit` cannot see `--amend` or `--fixup`.** The hook environment is
+  byte-identical to a normal commit, so both get rewritten into new commits on
+  top. There is no fix; `--no-verify` is the documented escape hatch.
+- **`auto-commit` must restore what `read-tree` destroys.** Rebuilding the
+  index drops skip-worktree bits (in a sparse checkout every excluded path then
+  reads as deleted to the next `git add -A`) and the stat cache. The `cleanup`
+  trap puts both back on the success *and* failure paths.
 - **`auto-commit` must pass through** when git is not operating on the real
   index (`GIT_INDEX_FILE` ending in `.lock`, i.e. `git commit -a` and pathspec
-  commits) or when a merge/cherry-pick/revert/rebase is in progress. Removing
-  either guard silently corrupts history; both are covered in
+  commits) or when a merge/squash-merge/cherry-pick/revert/rebase is in
+  progress. Removing either guard silently corrupts history; both are covered in
   `scripts/auto-commit.sh`.
 
 ## Nix gotchas seen in this repo
@@ -100,4 +156,5 @@ lane blocks `auto-commit`.
   module must be a single `config = { … }` block.
 - The dev shell deliberately does **not** put bare `git` on the interactive
   `PATH` — it would shadow a user's wrapped git and break commit identity. The
-  shellHook uses an absolute store path inside a subshell instead.
+  shellHook is a single call to the `wire-repo` wrapper, which carries its own
+  git via `runtimeInputs` — inside that process only, never on your `PATH`.
