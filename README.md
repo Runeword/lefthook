@@ -6,19 +6,26 @@ single generated lefthook config with the ordering baked in.
 
 ## How it works
 
-`lib.<system>.mkShell { hooks = { … }; }` is the only public entry point.
-`hooks` is an attrset where each known hook is toggled with `<name>.enable =
-true`. It returns a `pkgs.mkShell` derivation to drop into your own shell's
-`inputsFrom`. On shell entry it:
+`lib.<system>.mkShell { lanes = [ … ]; }` is the primary entry point (the flake
+also exposes `lib.<system>.toolchain`, the `nix run` scaffolder, and the wrapper
+scripts as `packages.<system>.*`). `lanes` enables whole language lanes;
+`hooks.<name>.enable` toggles individual hooks and always wins. It returns a
+`pkgs.mkShell` derivation to drop into your own shell's `inputsFrom`. On shell
+entry it:
 
 - puts the enabled tools plus `pkgs.lefthook` on `PATH`;
-- renders one lefthook config (via `pkgs.formats.yaml`) and copies it into the
-  project root as `lefthook-generated.yml` — commit that file: hooks then work
-  from `git checkout` onward (fresh clones, new worktrees, after garbage
-  collection) with no dependency on any machine's Nix store;
+- renders one lefthook config (via `pkgs.formats.yaml`) and writes it into the
+  project root as `lefthook-generated.yml` — commit that file, so the hook
+  definitions travel with the repo and don't depend on any machine's Nix store;
 - creates `lefthook.yml` if absent so it `extends` the generated file — and
   warns when an existing `lefthook.yml` doesn't reference it — then runs
-  `lefthook install`.
+  `lefthook install`, reporting any failure.
+
+Committing the config is not the same as installing the hooks. Git never clones
+`.git/hooks`, so a **fresh clone has no active hooks** until something runs
+`lefthook install` — entering this dev shell does that for you, and new
+worktrees of an already-installed repo inherit them. A clone where nobody has
+entered the shell commits with no checks at all.
 
 Every hook's `run:` command calls its tool by bare name, resolved from the dev
 shell `PATH`, so the generated config is machine-independent. A commit made
@@ -38,17 +45,37 @@ In any git repository:
 nix run github:Runeword/lefthook
 ```
 
-That detects which languages the repository contains, renders the matching
-config, writes `lefthook-generated.yml` + `lefthook.yml`, installs the git
-hooks and stages both files — commit them and you are done. The repository
-needs no flake input, no dev shell and no direnv; the config's `min_version`
-is stamped from the lefthook already on your `PATH`.
+That detects which languages the repository contains — from its tracked and
+untracked-but-not-ignored files — renders the matching config, writes
+`lefthook-generated.yml` + `lefthook.yml`, installs the git hooks and stages
+both files. Commit them and you are done. The repository needs no flake input,
+no dev shell and no direnv; the config's `min_version` is stamped from the
+lefthook already on your `PATH` (which must be 1.10.1 or newer — older
+lefthooks ignore the `jobs:` syntax and would run nothing).
+
+**`gitleaks` and `auto-commit` are on by default.** `auto-commit` splits every
+commit into one commit per file and cancels the umbrella commit, so `git commit`
+reports failure even when it worked — see [auto-commit](#auto-commit) before you
+adopt it, or pass `--no-auto-commit`.
+
+Anyone who later clones the scaffolded repo needs `lefthook install` once
+(or their own `nix run`) — the committed config alone activates nothing.
 
 Detection is overridable:
 
 ```sh
 nix run github:Runeword/lefthook -- --lanes nix,shell --no-auto-commit
 ```
+
+If the repository already ships its own lefthook config — `lefthook.yml`, any of
+its `.yaml`/`.json`/`.toml` or dotted variants, or a committed `lefthook-local.*`
+(all of which lefthook auto-loads) — the scaffolder writes the generated file
+but refuses to install hooks: doing so would activate that file's jobs, `rc` and
+`remotes`, which is exactly what git declines to do for a fresh clone. Read it,
+then re-run with `--adopt-existing-config`. Since your own config stays in place,
+add `lefthook-generated.yml` to its `extends:` list to actually turn the
+generated hooks (gitleaks, formatters, auto-commit) on — otherwise only your own
+config runs and `lefthook-init` warns you they are inactive.
 
 The only requirement is that the tools the config names are on `PATH` when you
 commit — either from a dev shell (below) or installed globally.
@@ -62,7 +89,7 @@ hand-written list does:
 
 ```nix
 # home-manager
-home.packages = [ … ] ++ inputs.lefthook.lib.${pkgs.system}.toolchain {
+home.packages = [ … ] ++ inputs.lefthook.lib.${pkgs.stdenv.hostPlatform.system}.toolchain {
   lanes = [ "nix" "shell" "toml" "yaml" ];
   gitleaks = true;
   autoCommit = true;
@@ -90,7 +117,7 @@ Then in your dev shell — `lanes` enables every hook in a language lane:
 { lefthook, pkgs, ... }:
 pkgs.mkShell {
   inputsFrom = [
-    (lefthook.lib.${pkgs.system}.mkShell {
+    (lefthook.lib.${pkgs.stdenv.hostPlatform.system}.mkShell {
       lanes = [ "nix" "shell" ];   # format → lint → security, per lane
       gitleaks = true;
       autoCommit = true;
@@ -103,7 +130,7 @@ pkgs.mkShell {
 over what a lane implies:
 
 ```nix
-lefthook.lib.${pkgs.system}.mkShell {
+lefthook.lib.${pkgs.stdenv.hostPlatform.system}.mkShell {
   lanes = [ "nix" ];
   hooks.lint-nix.enable = false;   # lane minus one hook
 }
@@ -152,10 +179,13 @@ cannot drift with how the attrset happens to be enumerated.
 - `LEFTHOOK=0 git commit …` skips every hook for one commit.
 - `LEFTHOOK_EXCLUDE=auto-commit git commit …` skips one job by name (works for
   nested jobs) — the practical way to get a single commit with your own
-  message.
-- `git commit --amend --no-verify` is the way to amend: a pre-commit hook
-  cannot detect `--amend`, so without `--no-verify` the fixup would land as a
-  new commit on top and the amend would silently not happen.
+  message. It matches **job** names, not the hook names in the table above:
+  the `format-shell` hook contributes two jobs, `shfmt` and `shellharden`.
+- `git commit --amend --no-verify` is the way to amend, and the same goes for
+  `git commit --fixup=<sha>`: a pre-commit hook cannot detect either (the
+  environment is byte-identical to a normal commit), so without `--no-verify`
+  the change lands as a new commit on top — the amend silently does not happen,
+  and a `fixup!` message is replaced, breaking `rebase --autosquash`.
 - `lefthook-local.yml` with `pre-commit: { skip: true }` turns the hooks off
   for one clone. Per-job `skip` entries in the local file append to the config
   rather than merging into nested jobs — use `LEFTHOOK_EXCLUDE` for that.
@@ -183,9 +213,12 @@ Consequences worth knowing:
 - Each file is committed from its **staged** blob, so partial staging
   (`git add -p`) is preserved: unstaged hunks stay in the working tree.
 - Situations where splitting would corrupt history pass through untouched as
-  one normal commit: concluding a merge, cherry-pick, revert, or rebase, and
-  `git commit -a` / pathspec commits (git runs those against a temporary
-  index).
+  one normal commit: concluding a merge, squash-merge, cherry-pick, revert, or
+  rebase; `git commit -a` / pathspec commits (git runs those against a
+  temporary index); and a staged filename containing a tab or newline, which
+  cannot be split safely.
+- `--amend` and `--fixup` are **not** among them — they are indistinguishable
+  from a normal commit at hook time. Use `--no-verify` (see above).
 
 ## Regenerating
 
@@ -198,7 +231,55 @@ the hook set or this flake changes:
 - **scaffolded repos** — re-run `nix run github:Runeword/lefthook -- --force`.
 
 Both paths render through the same module, so a scaffolded repository and one
-wired via `lib.mkShell` with the same hooks produce byte-identical output.
+wired via `lib.mkShell` with the same hooks and the same `minVersion` produce
+byte-identical output. They differ by default in exactly that line: `mkShell`
+stamps this flake's `pkgs.lefthook.version`, while the scaffolder stamps the
+lefthook it found on your `PATH`.
+
+### `minVersion`
+
+`min_version` has to describe a lefthook that will **run** the hooks, not the one
+that rendered the config — a config demanding a newer lefthook than the runner
+fails every commit. It defaults to the feature floor (below), a true lower bound
+every supported runner satisfies, rather than this flake's own
+`pkgs.lefthook.version`, which would ratchet the requirement upward on every
+`nix flake update` and reject older-but-adequate runners. Set it explicitly to
+pin a higher minimum:
+
+```nix
+lefthook.lib.${pkgs.stdenv.hostPlatform.system}.mkShell {
+  lanes = [ "nix" ];
+  minVersion = "2.1.1";   # demand at least this lefthook
+}
+```
+
+The floor is 1.13.0: `jobs:` needs 1.10.0, but below 1.13.0 the parallel lanes'
+post-format `git add` calls race `.git/index.lock` and `stage_fixed` silently
+drops the reformatted blobs — an even older lefthook accepts the config and runs
+nothing at all. A `minVersion` below the floor is rejected at render time.
+
+### `assertLefthookInstalled`
+
+The shim lefthook installs ends its search for a binary with a bare `echo`, so
+once that binary is unreachable — a garbage-collected store path, a fresh clone
+with no dev shell entered — the hook prints one line and **exits 0**, letting
+the commit through with every check skipped, secret scan included. This stamps
+`assert_lefthook_installed`, which turns that branch into an `exit 1`.
+`lefthook-init` gets the same protection without patching anything: the setting
+travels in the rendered config it writes, so any `lefthook install` bakes it in.
+
+It defaults to `true`, on the principle that a hook which checks nothing should
+say so rather than pass. Turn it off to restore lefthook's own default:
+
+```nix
+lefthook.lib.${pkgs.stdenv.hostPlatform.system}.mkShell {
+  lanes = [ "nix" ];
+  assertLefthookInstalled = false;   # missing lefthook = commit proceeds unchecked
+}
+```
+
+`LEFTHOOK=0 git commit` and `git commit --no-verify` still bypass hooks either
+way.
 
 ## Adding a hook
 
