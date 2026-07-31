@@ -4,6 +4,12 @@
 # `packages.<system>.<name>`, so a repository that commits without entering a
 # dev shell can install them globally and still resolve the config's bare
 # names).
+#
+# `runtimeInputs` must list every command a script calls, not just the headline
+# tool: writeShellApplication prepends these to PATH but leaves the ambient one
+# in place, so anything missing here silently resolves from whatever the commit
+# environment happens to have (a GUI git client's minimal PATH has bitten this).
+# Note coreutils does NOT ship `cmp` — that lives in diffutils.
 { pkgs }:
 {
   auto-commit = pkgs.writeShellApplication {
@@ -11,9 +17,26 @@
     runtimeInputs = [ pkgs.git ];
     text = builtins.readFile ./scripts/auto-commit.sh;
   };
+  # Not a hook: the shared "point this repo at a rendered config" step, called
+  # by both lefthook-init and the dev shell's shellHook. It carries its own git
+  # so neither caller needs one on its PATH.
+  wire-repo = pkgs.writeShellApplication {
+    name = "wire-repo";
+    runtimeInputs = [
+      pkgs.coreutils
+      pkgs.diffutils
+      pkgs.git
+      pkgs.gnugrep
+      pkgs.gnused
+    ];
+    text = builtins.readFile ./scripts/wire-repo.sh;
+  };
   lint-go = pkgs.writeShellApplication {
     name = "lint-go";
-    runtimeInputs = [ pkgs.golangci-lint ];
+    runtimeInputs = [
+      pkgs.coreutils
+      pkgs.golangci-lint
+    ];
     text = builtins.readFile ./scripts/lint-go.sh;
   };
   lint-nix = pkgs.writeShellApplication {
@@ -26,7 +49,18 @@
   };
   lint-opentofu = pkgs.writeShellApplication {
     name = "lint-opentofu";
-    runtimeInputs = [ pkgs.tflint ];
+    runtimeInputs = [
+      pkgs.coreutils
+      pkgs.tflint
+    ];
     text = builtins.readFile ./scripts/lint-opentofu.sh;
+  };
+  security-opentofu = pkgs.writeShellApplication {
+    name = "security-opentofu";
+    runtimeInputs = [
+      pkgs.coreutils
+      pkgs.trivy
+    ];
+    text = builtins.readFile ./scripts/security-opentofu.sh;
   };
 }
