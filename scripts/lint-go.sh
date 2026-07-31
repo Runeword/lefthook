@@ -10,7 +10,7 @@
 # so "golangci-lint run ./packages/custom/tool" fails with "no go files to
 # analyze". cd'ing in first lets it find the module that owns the staged file.
 for f in "$@"; do
-  dirname "$f"
+  dirname -- "$f"
 done | sort -u | while IFS= read -r dir; do
-  (cd "$dir" && golangci-lint run .) || exit 1
+  (cd -- "$dir" && golangci-lint run .) || exit 1
 done
