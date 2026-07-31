@@ -68,24 +68,73 @@
       devShells = forAllSystems (
         { system, ... }:
         {
+          # Spelled with the `lanes` shorthand this flake recommends, so a hook
+          # later added to one of these lanes reaches its own dev shell and
+          # committed config too — naming hooks individually silently opted the
+          # flagship repo out of the semantics it documents.
           default = self.lib.${system}.mkShell {
-            hooks = {
-              format-nix.enable = true;
-              lint-nix.enable = true;
-              format-shell.enable = true;
-              lint-shell.enable = true;
-              format-toml.enable = true;
-              format-yaml.enable = true;
-              security-gitleaks.enable = true;
-              auto-commit.enable = true;
-            };
+            lanes = [
+              "nix"
+              "shell"
+              "toml"
+              "yaml"
+            ];
+            gitleaks = true;
+            autoCommit = true;
           };
         }
       );
 
       checks = forAllSystems (
-        { system, pkgs, ... }:
         {
+          system,
+          pkgs,
+          lib,
+          ...
+        }:
+        {
+          # The dev shell exercises 4 of the 9 lanes, so without this the go,
+          # lua, opentofu, rust and zig hooks are never rendered, never loaded by
+          # lefthook, and their tools never even evaluated — a nixpkgs bump that
+          # breaks one first fails at a consumer's `nix develop`. Renders every
+          # hook, loads it the way consumers do (through the `extends`
+          # indirection, so min_version and assert_lefthook_installed are
+          # exercised as they reach the runner), and forces each tool's
+          # derivation to instantiate. Instantiate, not build: that catches a
+          # removed attribute or an insecure-marked package without pulling
+          # every toolchain in nixpkgs through the cache on each check.
+          lefthook-all-lanes =
+            let
+              args = {
+                lanes = lib.attrNames (
+                  lib.groupBy (h: h.lane) (
+                    lib.filter (h: h ? lane) (lib.attrValues (import ./hooks.nix { inherit pkgs; }))
+                  )
+                );
+                gitleaks = true;
+                autoCommit = true;
+              };
+              rendered = (self.lib.${system}.mkShell args).lefthookConfig;
+              toolsInstantiated = builtins.length (map (p: p.drvPath) (self.lib.${system}.toolchain args));
+            in
+            pkgs.runCommand "check-lefthook-all-lanes"
+              {
+                nativeBuildInputs = [
+                  pkgs.git
+                  pkgs.lefthook
+                ];
+                inherit toolsInstantiated;
+              }
+              ''
+                export HOME="$TMPDIR"
+                cd "$TMPDIR"
+                git init -q
+                cp ${rendered} lefthook-generated.yml
+                printf 'extends:\n  - lefthook-generated.yml\n' >lefthook.yml
+                lefthook dump >/dev/null
+                touch "$out"
+              '';
+
           lefthook-config =
             let
               rendered = self.devShells.${system}.default.lefthookConfig;
