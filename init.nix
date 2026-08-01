@@ -31,6 +31,9 @@ pkgs.writeShellApplication {
     (import ./wrappers.nix { inherit pkgs; }).wire-repo
   ];
   text = ''
+    FEATURE_FLOOR=${import ./feature-floor.nix}
+    LEFTHOOK_MAIN_CONFIGS="${(import ./config-names.nix).main}"
+    LEFTHOOK_LOCAL_CONFIGS="${(import ./config-names.nix).local}"
     SELF=${self}
     NIXPKGS=${nixpkgs}
     SYSTEM=${system}
