@@ -8,13 +8,10 @@
 # Usage: lefthook-init [--lanes a,b] [--no-gitleaks] [--no-auto-commit]
 #                      [--force] [--adopt-existing-config]
 
-# The oldest lefthook this config supports. `jobs:` landed in 1.10.0, but the
-# real floor is 1.13.0: below it the parallel lanes' post-format `git add` calls
-# race `.git/index.lock`, `stage_fixed` fails with only a warning, and the
-# commit lands the UN-formatted blobs (exit 0). An even older runner accepts the
-# config, ignores every job and exits 0. Either way a too-old runner checks
-# nothing silently, so the floor is enforced rather than merely stamped.
-feature_floor=1.13.0
+# FEATURE_FLOOR is prepended at build time from feature-floor.nix, the single
+# source shared with mk-shell.nix — a second literal here would drift. It is
+# enforced on the runner below rather than merely stamped, because a too-old
+# lefthook checks nothing *silently*.
 
 # lane:regex — the file extensions each lane's hooks glob for. Single source of
 # truth for detection, for validating --lanes, and for --help.
@@ -195,37 +192,9 @@ fi
 # this replaces silently omitted the whole `.config/` stem and the `.jsonc`
 # extension, which reopened exactly the hole the gate exists to close.
 own_config=$(printf 'extends:\n  - lefthook-generated.yml')
-config_stems="lefthook .lefthook .config/lefthook"
-config_exts="yml yaml json jsonc toml"
-config_names=""
-remaining_stems=$config_stems
-while [ "$remaining_stems" != "" ]; do
-  case $remaining_stems in
-    *' '*)
-      stem=${remaining_stems%% *}
-      remaining_stems=${remaining_stems#* }
-      ;;
-    *)
-      stem=$remaining_stems
-      remaining_stems=""
-      ;;
-  esac
-  remaining_exts=$config_exts
-  while [ "$remaining_exts" != "" ]; do
-    case $remaining_exts in
-      *' '*)
-        ext=${remaining_exts%% *}
-        remaining_exts=${remaining_exts#* }
-        ;;
-      *)
-        ext=$remaining_exts
-        remaining_exts=""
-        ;;
-    esac
-    config_names="$config_names $stem.$ext $stem-local.$ext"
-  done
-done
-config_names=${config_names# }
+# LEFTHOOK_MAIN_CONFIGS / LEFTHOOK_LOCAL_CONFIGS are prepended at build time
+# from config-names.nix, shared with wire-repo.sh.
+config_names="$LEFTHOOK_MAIN_CONFIGS $LEFTHOOK_LOCAL_CONFIGS"
 
 # Consumed field by field (the shellharden-safe idiom the lane probes use), not
 # `for c in $config_names`.
@@ -323,8 +292,8 @@ version_ge() {
   return 0
 }
 
-if ! version_ge "$runner_version" "$feature_floor"; then
-  echo "lefthook-init: lefthook $runner_version is too old; this config needs >= $feature_floor." >&2
+if ! version_ge "$runner_version" "$FEATURE_FLOOR"; then
+  echo "lefthook-init: lefthook $runner_version is too old; this config needs >= $FEATURE_FLOOR." >&2
   echo "lefthook-init: below it a runner either ignores the jobs syntax and exits 0, or races" >&2
   echo "lefthook-init: .git/index.lock and silently drops formatter fixes. Upgrade, then re-run." >&2
   exit 1
@@ -354,7 +323,7 @@ rendered=$(nix build --impure --no-link --print-out-paths \
     lanes = [ $lanes_nix ];
     gitleaks = $gitleaks;
     autoCommit = $auto_commit;
-    minVersion = \"$runner_version\";
+    minVersion = \"$FEATURE_FLOOR\";
   }).lefthookConfig
 ") || {
   echo "lefthook-init: failed to render the config" >&2
@@ -399,10 +368,26 @@ if [ "$adopted_foreign_config" = true ] && [ "$adopt" = false ]; then
       echo "lefthook-init: this repository has a $cfg that cannot be read (dangling symlink?)." >&2
       continue
     fi
-    config_lines=$(wc -l <"$cfg" | tr -d ' ')
+    # A lone CR is a line break to YAML but not to `wc -l`, so a config that
+    # separates its lines with CRs counts as ONE line and slips under the
+    # threshold below, however long it really is. Fold CRLF first, or a DOS
+    # config counts double and hides behind "too long to show" instead.
+    config_lines=$(sed 's/\r$//' "$cfg" | tr '\r' '\n' | wc -l | tr -d ' ')
     if [ "$config_lines" -le 40 ]; then
-      echo "lefthook-init: this repository ships its own $cfg:" >&2
-      sed 's/^/  | /' "$cfg" >&2
+      echo "lefthook-init: this repository ships its own $cfg — any run/script/runner/rc/extends/remotes key in it runs code:" >&2
+      # Sanitised, not printed raw: a config may legitimately parse while
+      # containing bytes that move the cursor instead of printing, so the reader
+      # approves something other than what runs. U+202E (RIGHT-TO-LEFT OVERRIDE)
+      # reorders the rendered line on a bidi-aware terminal; a lone CR is a line
+      # break to YAML but not to sed, so two jobs on one printed line become one
+      # line the terminal repaints — the second overwriting the first from column
+      # 0, hiding it behind a benign-looking twin. Hence print+blank only, not
+      # print+space: [:space:] admits CR, FF and VT, which is the whole trick.
+      # [:blank:] adds the tab (harmless: it cannot revisit printed columns).
+      # LC_ALL=C makes every byte of a multi-byte character non-printable, so
+      # accented text shows as `?` here too; on a screen whose only job is a
+      # security decision that is the right trade.
+      LC_ALL=C sed 's/[^[:print:][:blank:]]/?/g' "$cfg" | sed 's/^/  | /' >&2
     else
       # No danger-key grep here: quoting a key, or padding a space before its
       # colon, is ordinary YAML that lefthook still parses but a pattern would
@@ -413,7 +398,7 @@ if [ "$adopted_foreign_config" = true ] && [ "$adopt" = false ]; then
     fi
     # extends/remotes pull in FURTHER files (local, or fetched over the network)
     # whose payload is not on this screen — flag that for every shown config.
-    if grep -qE '^[[:space:]]*(extends|remotes):' "$cfg" 2>/dev/null; then
+    if grep -qE "(^|[[{,[:space:]\"'])(extends|remotes)[\"']?[[:space:]]*[:=]" "$cfg" 2>/dev/null; then
       echo "lefthook-init: NOTE: $cfg has an 'extends' or 'remotes' key — it loads more files not shown above; review those too." >&2
     fi
   done
@@ -436,8 +421,16 @@ fi
 # `git add` below fails on an ignored path, and errexit would abort AFTER the
 # hooks were installed — leaving the repository hooked with a config git will
 # never commit, and only git's generic advice to explain it.
-if ignore_rule=$(git check-ignore -v -- lefthook-generated.yml 2>/dev/null); then
+if git check-ignore -q -- lefthook-generated.yml; then
+  ignore_rule=$(git check-ignore -v -- lefthook-generated.yml 2>/dev/null || true)
   echo "lefthook-init: lefthook-generated.yml is ignored by: $ignore_rule" >&2
+  echo "lefthook-init: it has to be committed for the hooks to travel with the repository." >&2
+  echo "lefthook-init: drop that ignore rule, then re-run. NO hooks were installed." >&2
+  exit 1
+fi
+
+if [ "$created_root_config" = true ] && git check-ignore -q -- lefthook.yml; then
+  echo "lefthook-init: lefthook.yml is ignored by: $(git check-ignore -v -- lefthook.yml 2>/dev/null || true)" >&2
   echo "lefthook-init: it has to be committed for the hooks to travel with the repository." >&2
   echo "lefthook-init: drop that ignore rule, then re-run. NO hooks were installed." >&2
   exit 1
@@ -459,14 +452,23 @@ fi
 # clean "done" below read as "everything is protected".
 generated_active=true
 if [ ! -r lefthook.yml ] ||
-  ! grep -E '(^|[^.])lefthook-generated\.yml' lefthook.yml >/dev/null 2>&1; then
+  ! sed 's/#.*//' lefthook.yml | grep -E '(^|[^.])lefthook-generated\.yml' >/dev/null 2>&1; then
   generated_active=false
+fi
+
+# `lefthook install` only writes shims for the hooks the LOADED config declares,
+# so when the generated file is not reached the summary must not claim its hooks
+# were installed — that line used to contradict the warning printed just below.
+if [ "$generated_active" = true ]; then
+  hooks_summary="installed into $(git rev-parse --git-path hooks)"
+else
+  hooks_summary="NOT installed for the generated config (see the warning below)"
 fi
 
 cat <<EOF
 lefthook-init: done.
   wrote    $wrote
-  hooks    installed into $(git rev-parse --git-path hooks)
+  hooks    $hooks_summary
   tools    the config calls them by bare name; they must be on PATH at commit
            time (a dev shell, or installed globally)
 EOF
