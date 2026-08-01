@@ -6,26 +6,48 @@
 # their own copy of this sequence, in two languages, and had already drifted:
 # only one of them kept `lefthook-local.yml` out of the index.
 #
-# Usage: wire-repo <rendered-config> <lefthook-binary> [--no-install]
+# Usage: wire-repo <rendered-config> <lefthook-binary> [--no-install] [--warn-drift]
 #
 #   --no-install   write the files but leave .git/hooks alone. Used when the
 #                  caller has decided the repository's own lefthook.yml must
 #                  not be activated without consent.
+#   --warn-drift   never overwrite an existing lefthook-generated.yml: create
+#                  it when missing, but when it drifts from the render, print a
+#                  warning naming `lefthook-regen` instead of rewriting it.
+#                  Used by the dev shell's shellHook, so entering a directory
+#                  reconciles only unversioned state (.git/hooks, info/exclude)
+#                  — rewriting a tracked file stays an explicit action.
+
+usage() {
+  echo "usage: wire-repo <rendered-config> <lefthook-binary> [--no-install] [--warn-drift]" >&2
+  exit 2
+}
 
 # Exposed as a package, so misuse comes from outside this flake too: fail with a
 # usage message rather than `$1: unbound variable`, and before any file is
-# written — a two-argument call that put `--no-install` in $2 used to mutate the
+# written — a two-argument call that put a flag in $2 used to mutate the
 # repository and only then fail on the missing binary.
-if [ "$#" -lt 2 ] || [ "$1" = "" ] || [ "$2" = "" ] || [ "$2" = "--no-install" ]; then
-  echo "usage: wire-repo <rendered-config> <lefthook-binary> [--no-install]" >&2
-  exit 2
+if [ "$#" -lt 2 ] || [ "$1" = "" ] || [ "$2" = "" ]; then
+  usage
 fi
+case $2 in
+  --no-install | --warn-drift) usage ;;
+esac
 rendered=$1
 lefthook_bin=$2
+shift 2
+# Flags are validated rather than merely compared: --no-install is the consent
+# gate, so a typo like `--no-instal` must not silently fall through to
+# installing hooks.
 install_hooks=true
-if [ "${3:-}" = "--no-install" ]; then
-  install_hooks=false
-fi
+warn_drift=false
+for flag in "$@"; do
+  case $flag in
+    --no-install) install_hooks=false ;;
+    --warn-drift) warn_drift=true ;;
+    *) usage ;;
+  esac
+done
 
 # Checked here rather than by each caller, so neither needs git on its own PATH.
 if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
@@ -43,8 +65,19 @@ cd "$project_root" || exit 1
 # symlinks: a link whose target happens to hold the current render would
 # otherwise be left in place and later committed as a symlink to a store path,
 # which dangles on every other machine.
+#
+# Under --warn-drift only a MISSING config is created (first-time wiring has
+# nothing to preserve); an existing file that differs — or is a symlink — is
+# reported and left alone. The rewrite is `lefthook-regen`, which runs this
+# script without the flag; the `mkConfigCheck` flake check is what makes
+# ignoring the warning fail loudly instead of drifting silently.
 if [ -L lefthook-generated.yml ] || ! cmp -s "$rendered" lefthook-generated.yml 2>/dev/null; then
-  install -m 644 "$rendered" lefthook-generated.yml
+  if [ "$warn_drift" = true ] && { [ -e lefthook-generated.yml ] || [ -L lefthook-generated.yml ]; }; then
+    echo "lefthook: warning: lefthook-generated.yml no longer matches what the flake renders;" >&2
+    echo "lefthook: warning: run 'lefthook-regen' to rewrite it, then commit the result." >&2
+  else
+    install -m 644 "$rendered" lefthook-generated.yml
+  fi
 fi
 
 # Migration: drop the git-ignored symlink older versions left behind.
@@ -93,11 +126,42 @@ if [ -e lefthook.yml ]; then
     echo "lefthook: warning: lefthook.yml does not extend lefthook-generated.yml; generated hooks are inactive" >&2
   fi
 else
-  if [ -L lefthook.yml ]; then
-    echo "lefthook: warning: lefthook.yml was a dangling symlink; replacing it with a real config" >&2
-    rm -f lefthook.yml
+  # A repository can ship its main config under any of the names lefthook reads.
+  # `lefthook.yml` is FIRST in that search order, so seeding one here would make
+  # theirs inert — silently, and after the scaffolder just showed it to them as
+  # the file that would run. Leave it alone and say what to add instead.
+  rival=""
+  remaining_mains=$LEFTHOOK_MAIN_CONFIGS
+  while [ "$remaining_mains" != "" ]; do
+    case $remaining_mains in
+      *' '*)
+        candidate=${remaining_mains%% *}
+        remaining_mains=${remaining_mains#* }
+        ;;
+      *)
+        candidate=$remaining_mains
+        remaining_mains=""
+        ;;
+    esac
+    [ "$candidate" != "lefthook.yml" ] || continue
+    if [ -e "$candidate" ] || [ -L "$candidate" ]; then
+      rival=$candidate
+      break
+    fi
+  done
+
+  if [ "$rival" != "" ]; then
+    echo "lefthook: warning: this repository already has $rival, which lefthook loads." >&2
+    echo "lefthook: warning: not creating a lefthook.yml, which would shadow it. Add" >&2
+    echo "lefthook: warning: 'lefthook-generated.yml' to that file's extends: list to activate" >&2
+    echo "lefthook: warning: the generated hooks." >&2
+  else
+    if [ -L lefthook.yml ]; then
+      echo "lefthook: warning: lefthook.yml was a dangling symlink; replacing it with a real config" >&2
+      rm -f lefthook.yml
+    fi
+    printf 'extends:\n  - lefthook-generated.yml\n' >lefthook.yml
   fi
-  printf 'extends:\n  - lefthook-generated.yml\n' >lefthook.yml
 fi
 
 if [ "$install_hooks" = false ]; then
