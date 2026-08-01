@@ -94,15 +94,19 @@
         }:
         {
           # The dev shell exercises 4 of the 9 lanes, so without this the go,
-          # lua, opentofu, rust and zig hooks are never rendered, never loaded by
-          # lefthook, and their tools never even evaluated — a nixpkgs bump that
-          # breaks one first fails at a consumer's `nix develop`. Renders every
-          # hook, loads it the way consumers do (through the `extends`
-          # indirection, so min_version and assert_lefthook_installed are
-          # exercised as they reach the runner), and forces each tool's
-          # derivation to instantiate. Instantiate, not build: that catches a
-          # removed attribute or an insecure-marked package without pulling
-          # every toolchain in nixpkgs through the cache on each check.
+          # lua, opentofu, rust and zig hooks are never rendered, never loaded
+          # by lefthook, and their tools never even evaluated — a nixpkgs bump
+          # that breaks one first fails at a consumer's `nix develop`.
+          #
+          # This renders every hook, loads the result through the same `extends`
+          # indirection consumers use, and forces each tool's derivation to
+          # instantiate — instantiate, not build, so a removed attribute or an
+          # insecure-marked package is caught without pulling every toolchain in
+          # nixpkgs through the cache on each check.
+          #
+          # `lefthook dump` merges the two files but enforces neither
+          # `min_version` nor `assert_lefthook_installed`; both bite at `run`
+          # time, so this check does not cover them.
           lefthook-all-lanes =
             let
               args = {
@@ -115,7 +119,14 @@
                 autoCommit = true;
               };
               rendered = (self.lib.${system}.mkShell args).lefthookConfig;
-              toolsInstantiated = builtins.length (map (p: p.drvPath) (self.lib.${system}.toolchain args));
+              # deepSeq, not a bare `builtins.length`: length forces only the
+              # list spine, so the drvPath thunks would never be evaluated and
+              # this check would pass on a toolchain that cannot instantiate.
+              toolsInstantiated =
+                let
+                  paths = map (p: p.drvPath) (self.lib.${system}.toolchain args);
+                in
+                builtins.deepSeq paths (builtins.length paths);
             in
             pkgs.runCommand "check-lefthook-all-lanes"
               {
@@ -135,29 +146,11 @@
                 touch "$out"
               '';
 
-          lefthook-config =
-            let
-              rendered = self.devShells.${system}.default.lefthookConfig;
-            in
-            pkgs.runCommand "check-lefthook-config"
-              {
-                nativeBuildInputs = [
-                  pkgs.git
-                  pkgs.lefthook
-                ];
-              }
-              ''
-                # The committed copy must match what the flake renders.
-                cmp ${./lefthook-generated.yml} ${rendered}
-
-                # lefthook must be able to load the rendered config.
-                export HOME="$TMPDIR"
-                cd "$TMPDIR"
-                git init -q
-                cp ${rendered} lefthook.yml
-                lefthook dump >/dev/null
-                touch "$out"
-              '';
+          # The committed config must match what the flake renders, and
+          # lefthook must be able to load it. Built with the same
+          # `mkConfigCheck` every consumer gets from `mkShell`'s passthru, so
+          # the exported check is itself under test here.
+          lefthook-config = self.devShells.${system}.default.mkConfigCheck self;
         }
       );
     };
