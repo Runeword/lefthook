@@ -38,13 +38,9 @@ let
   # The shared repo-wiring step, also used by `lefthook-init`.
   wrappers = import ./wrappers.nix { inherit pkgs; };
 
-  # The oldest lefthook the generated config supports. `jobs:` landed in 1.10.0,
-  # but the real floor is 1.13.0: before it the parallel lanes' post-format
-  # `git add` calls race `.git/index.lock`, `stage_fixed` fails with only a
-  # warning, and the commit lands the UN-formatted blobs (exit 0). `min_version`
-  # must never be stamped below this; the scaffolder enforces the same value on
-  # the runner it finds.
-  featureFloor = "1.13.0";
+  # Shared with scripts/init.sh, which gates the runner on it and stamps it as
+  # the config's `min_version`. See feature-floor.nix for why 1.13.0.
+  featureFloor = import ./feature-floor.nix;
 
   # Every lane declared in hooks.nix — the domain of the `lanes` option.
   laneNames = sort (a: b: a < b) (unique (map (h: h.lane) (filter (h: h ? lane) (attrValues hooks))));
@@ -121,13 +117,15 @@ let
   # names as strings, so renaming one in hooks.nix would silently stop enabling
   # it — the secret scan included — while `lanes` and `hooks.<name>` keep
   # validating. Fail on the rename instead.
-  shorthandHooks = [
-    "security-gitleaks"
-    "auto-commit"
-  ];
+  # Option name -> the hook it enables, in one place so the validator below and
+  # the `byFlag` test in the module cannot disagree about either half.
+  shorthandHooks = {
+    gitleaks = "security-gitleaks";
+    autoCommit = "auto-commit";
+  };
   validShorthands =
     let
-      missing = filter (n: !(hooks ? ${n})) shorthandHooks;
+      missing = filter (n: !(hooks ? ${n})) (attrValues shorthandHooks);
     in
     if missing == [ ] then
       true
@@ -302,8 +300,9 @@ let
           name: h:
           let
             byLane = h ? lane && elem h.lane config.lanes;
-            byFlag =
-              (name == "security-gitleaks" && config.gitleaks) || (name == "auto-commit" && config.autoCommit);
+            byFlag = builtins.any (flag: shorthandHooks.${flag} == name && config.${flag}) (
+              attrNames shorthandHooks
+            );
           in
           {
             enable = mkDefault (byLane || byFlag);
@@ -320,10 +319,35 @@ let
             # Rendered through yamlfmt so the committed file is already canonical
             # for the format-yaml hook — otherwise every commit staging it would
             # reformat it away from what this flake regenerates.
-            configFile = pkgs.runCommand "lefthook-generated.yml" { nativeBuildInputs = [ pkgs.yamlfmt ]; } ''
-              install -m 644 ${rawConfig} "$out"
-              yamlfmt "$out"
-            '';
+            # Warned here as well as on `toolchain`: building only
+            # `.lefthookConfig` (the documented way to regenerate the committed
+            # file) forces neither `packages` nor the shell, so without this the
+            # regeneration path could write a checks-nothing config in silence.
+            configFile =
+              lib.warnIf (enabledNames == [ ])
+                "lefthook: no hooks enabled — set `lanes`, `gitleaks`, `autoCommit` or `hooks.<name>.enable`, or this checks nothing"
+                pkgs.runCommand
+                "lefthook-generated.yml"
+                { nativeBuildInputs = [ pkgs.yamlfmt ]; }
+                ''
+                  install -m 644 ${rawConfig} "$out"
+                  yamlfmt "$out"
+                '';
+            # The explicit "rewrite the committed config" step named by the
+            # shellHook's drift warning. Bound to this exact render, so it can
+            # never regenerate from a different hook set than the shell it came
+            # from. Carries its own lefthook (same pin as `toolchain`), so it
+            # also works from outside the shell.
+            regen = pkgs.writeShellApplication {
+              name = "lefthook-regen";
+              runtimeInputs = [
+                wrappers.wire-repo
+                pkgs.lefthook
+              ];
+              text = ''
+                exec wire-repo ${configFile} lefthook "$@"
+              '';
+            };
           in
           assert hooksValid;
           assert lib.assertMsg (!lib.versionOlder config.minVersion featureFloor) (
@@ -338,22 +362,69 @@ let
             # user's wrapped git (one exporting GIT_CONFIG_GLOBAL for identity),
             # breaking `git commit` from inside the shell. The shellHook needs no
             # git of its own — wire-repo brings one inside its own process.
-            packages = config.toolchain;
-            # Exposed so the rendered config can be built and inspected directly:
-            #   nix build .#devShells.<system>.default.lefthookConfig
-            passthru.lefthookConfig = configFile;
-            # Writes the config, seeds lefthook.yml, keeps lefthook-local.yml out
-            # of the index, warns on core.hooksPath, and installs the hooks —
-            # the same script `lefthook-init` runs, so the two paths cannot
-            # drift. It carries its own git, so nothing here needs one on PATH
-            # (a bare git would shadow a user's wrapped git and break commit
-            # identity) and no subshell is needed to contain it.
+            packages = config.toolchain ++ [ regen ];
+            passthru = {
+              # Exposed so the rendered config can be built and inspected directly:
+              #   nix build .#devShells.<system>.default.lefthookConfig
+              lefthookConfig = configFile;
+              # Drift enforcement for consumers — the same check this flake runs
+              # on itself. Takes the repository source (usually `self`) and
+              # asserts its committed lefthook-generated.yml byte-matches this
+              # shell's render, then that lefthook can load the result. Built
+              # from the same `configFile` as the shellHook and `lefthook-regen`,
+              # so the check and the shell cannot disagree about what "in sync"
+              # means. `inputsFrom` does not carry passthru, so keep a handle on
+              # the inner shell:
+              #   let lh = lefthook.lib.${system}.mkShell { … };
+              #   in {
+              #     devShells.default = pkgs.mkShell { inputsFrom = [ lh ]; };
+              #     checks.lefthook-config = lh.mkConfigCheck self;
+              #   }
+              # `lefthook dump` merges but enforces neither `min_version` nor
+              # `assert_lefthook_installed`; both bite at `run` time, not here.
+              mkConfigCheck =
+                src:
+                pkgs.runCommand "check-lefthook-config"
+                  {
+                    nativeBuildInputs = [
+                      pkgs.git
+                      pkgs.lefthook
+                    ];
+                  }
+                  ''
+                    # The committed copy must match what the flake renders.
+                    if ! cmp ${src}/lefthook-generated.yml ${configFile}; then
+                      echo "lefthook: committed lefthook-generated.yml does not match the flake's render;" >&2
+                      echo "lefthook: run 'lefthook-regen' in the dev shell and commit the result" >&2
+                      exit 1
+                    fi
+
+                    # lefthook must be able to load the rendered config.
+                    export HOME="$TMPDIR"
+                    cd "$TMPDIR"
+                    git init -q
+                    cp ${configFile} lefthook.yml
+                    lefthook dump >/dev/null
+                    touch "$out"
+                  '';
+            };
+            # Reconciles unversioned state — installs the hooks, seeds
+            # lefthook.yml, keeps lefthook-local.yml out of the index, warns on
+            # core.hooksPath — and creates lefthook-generated.yml only when it
+            # is missing. When the committed file has merely drifted from the
+            # render, `--warn-drift` prints the warning naming `lefthook-regen`
+            # (on this shell's PATH) instead of rewriting a tracked file on
+            # directory entry. Same script `lefthook-init` runs (in write mode),
+            # so the two wiring paths cannot drift. It carries its own git, so
+            # nothing here needs one on PATH (a bare git would shadow a user's
+            # wrapped git and break commit identity) and no subshell is needed
+            # to contain it.
             #
             # The shim's "can't find lefthook" branch exits 1 rather than 0
             # because the rendered config carries `assert_lefthook_installed`,
             # honoured since lefthook 1.4.8 and read through `extends`.
             shellHook = ''
-              ${wrappers.wire-repo}/bin/wire-repo ${configFile} lefthook
+              ${wrappers.wire-repo}/bin/wire-repo ${configFile} lefthook --warn-drift
             '';
           };
       };
