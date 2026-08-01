@@ -247,21 +247,19 @@ in
     ];
   };
 
-  # Scans the staged diff, forced to text with `git diff --cached --text` piped
-  # into `gitleaks stdin`. NOT `gitleaks git --staged`: that reads `git diff`,
-  # which honours `.gitattributes`, so a single `*.env -diff` (or `binary`) line
-  # — landed by a PR, a teammate, or an adopted repo — silently removes those
-  # paths from the scan. `--text` overrides that and cannot be suppressed from
-  # inside the repo. (Trade-off: stdin mode does not consult `.gitleaksignore`,
-  # which this project treats as a feature — a silent allowlist is the same
-  # blind spot.)
+  # A wrapper, not a pipeline in `run`: lefthook executes `run` through `sh -c`
+  # with pipefail OFF, so `git diff … | gitleaks stdin` reported only gitleaks'
+  # status and PASSED whenever the diff command failed. The wrapper also forces
+  # `--text` past `.gitattributes` blinding, pins the ruleset so a repo-shipped
+  # `.gitleaks.toml` cannot disable the scan, scans added lines only (so the
+  # commit that REMOVES a secret is not blocked), and names the offending files.
   security-gitleaks = {
     standalone = true;
-    tools = [ pkgs.gitleaks ];
+    tools = [ wrappers.security-gitleaks ];
     jobs = [
       {
         name = "security-gitleaks";
-        run = "git diff --cached --text | gitleaks stdin --redact --verbose --no-banner --log-level=warn";
+        run = "security-gitleaks";
       }
     ];
   };
