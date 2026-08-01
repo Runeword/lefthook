@@ -11,11 +11,39 @@
 # environment happens to have (a GUI git client's minimal PATH has bitten this).
 # Note coreutils does NOT ship `cmp` — that lives in diffutils.
 { pkgs }:
+let
+  # gitleaks reads `.gitleaks.toml` from the working directory, so a scanned
+  # repository can disable the scan by shipping one. Pinning the ruleset here
+  # takes that away: `useDefault` pulls in gitleaks' own built-in rules, and
+  # this file — not the repository's — is what the hook reads.
+  gitleaksConfig = pkgs.writeText "gitleaks-pinned.toml" ''
+    [extend]
+    useDefault = true
+  '';
+in
 {
   auto-commit = pkgs.writeShellApplication {
     name = "auto-commit";
-    runtimeInputs = [ pkgs.git ];
+    # sed and grep are used by the skip-worktree snapshot and the
+    # deletions-before-additions reorder, not just git.
+    runtimeInputs = [
+      pkgs.git
+      pkgs.gnugrep
+      pkgs.gnused
+    ];
     text = builtins.readFile ./scripts/auto-commit.sh;
+  };
+  security-gitleaks = pkgs.writeShellApplication {
+    name = "security-gitleaks";
+    runtimeInputs = [
+      pkgs.git
+      pkgs.gitleaks
+      pkgs.gnused
+    ];
+    text = ''
+      GITLEAKS_CONFIG_FILE=${gitleaksConfig}
+    ''
+    + builtins.readFile ./scripts/security-gitleaks.sh;
   };
   # Not a hook: the shared "point this repo at a rendered config" step, called
   # by both lefthook-init and the dev shell's shellHook. It carries its own git
@@ -29,7 +57,10 @@
       pkgs.gnugrep
       pkgs.gnused
     ];
-    text = builtins.readFile ./scripts/wire-repo.sh;
+    text = ''
+      LEFTHOOK_MAIN_CONFIGS="${(import ./config-names.nix).main}"
+    ''
+    + builtins.readFile ./scripts/wire-repo.sh;
   };
   lint-go = pkgs.writeShellApplication {
     name = "lint-go";
