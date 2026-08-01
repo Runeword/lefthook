@@ -13,10 +13,14 @@ scripts as `packages.<system>.*`). `lanes` enables whole language lanes;
 `pkgs.mkShell` derivation to drop into your own shell's `inputsFrom`. On shell
 entry it:
 
-- puts the enabled tools plus `pkgs.lefthook` on `PATH`;
-- renders one lefthook config (via `pkgs.formats.yaml`) and writes it into the
-  project root as `lefthook-generated.yml` — commit that file, so the hook
-  definitions travel with the repo and don't depend on any machine's Nix store;
+- puts the enabled tools plus `pkgs.lefthook` on `PATH` (and `lefthook-regen`,
+  below);
+- renders one lefthook config (via `pkgs.formats.yaml`) and, on **first**
+  entry, writes it into the project root as `lefthook-generated.yml` — commit
+  that file, so the hook definitions travel with the repo and don't depend on
+  any machine's Nix store. Entry never rewrites an existing one: when the
+  render changes, the shellHook warns and `lefthook-regen` is the explicit
+  rewrite (see [Regenerating](#regenerating));
 - creates `lefthook.yml` if absent so it `extends` the generated file — and
   warns when an existing `lefthook.yml` doesn't reference it — then runs
   `lefthook install`, reporting any failure.
@@ -49,9 +53,10 @@ That detects which languages the repository contains — from its tracked and
 untracked-but-not-ignored files — renders the matching config, writes
 `lefthook-generated.yml` + `lefthook.yml`, installs the git hooks and stages
 both files. Commit them and you are done. The repository needs no flake input,
-no dev shell and no direnv; the config's `min_version` is stamped from the
-lefthook already on your `PATH` (which must be 1.10.1 or newer — older
-lefthooks ignore the `jobs:` syntax and would run nothing).
+no dev shell and no direnv. The lefthook on your `PATH` must be 1.13.0 or
+newer (see [`minVersion`](#minversion) for why); the config's `min_version` is
+stamped with that floor, not with your local version, so a teammate on an older
+— but still supported — lefthook is not locked out.
 
 **`gitleaks` and `auto-commit` are on by default.** `auto-commit` splits every
 commit into one commit per file and cancels the umbrella commit, so `git commit`
@@ -101,7 +106,8 @@ one-command setup. Adding a language later means adding a lane here and
 re-running `home-manager switch` — not editing each repository.
 
 The wrapper scripts are also exposed individually as
-`packages.<system>.{auto-commit,lint-nix,lint-go,lint-opentofu}`.
+`packages.<system>.{auto-commit,security-gitleaks,security-opentofu,lint-nix,lint-go,lint-opentofu}`
+(plus `wire-repo` and `lefthook-init`, which are tooling rather than hooks).
 
 ## Installation as a flake input
 
@@ -138,6 +144,9 @@ lefthook.lib.${pkgs.stdenv.hostPlatform.system}.mkShell {
 
 On first shell entry the flake writes `lefthook-generated.yml` (and a
 `lefthook.yml` extending it, if you had none) into the repo — commit both.
+Later entries leave both files alone; see
+[Regenerating](#regenerating) for what happens when the render changes, and
+[the drift check](#the-drift-check) for making CI enforce it.
 
 If you already have a `lefthook.yml` (for `pre-push` jobs, say), add the
 generated file to its `extends:` list yourself:
@@ -215,7 +224,8 @@ Consequences worth knowing:
 - Situations where splitting would corrupt history pass through untouched as
   one normal commit: concluding a merge, squash-merge, cherry-pick, revert, or
   rebase; `git commit -a` / pathspec commits (git runs those against a
-  temporary index); and a staged filename containing a tab or newline, which
+  temporary index); and a staged filename containing a tab, newline, quote or
+  backslash, which
   cannot be split safely.
 - `--amend` and `--fixup` are **not** among them — they are indistinguishable
   from a normal commit at hook time. Use `--no-verify` (see above).
@@ -225,16 +235,40 @@ Consequences worth knowing:
 The generated config is a committed artifact, so it has to be refreshed when
 the hook set or this flake changes:
 
-- **dev-shell repos** — re-enter the shell (`direnv reload`); the shellHook
-  rewrites the file whenever it differs, and warns if `lefthook.yml` stops
-  referencing it.
+- **dev-shell repos** — run `lefthook-regen` (on the shell `PATH`, bound to
+  that shell's exact render), then commit the result. Re-entering the shell
+  does *not* rewrite the file — entry only creates it when missing and prints
+  a warning when it has drifted, so a `cd` never rewrites tracked files behind
+  your back. The shellHook still warns if `lefthook.yml` stops referencing the
+  generated file.
 - **scaffolded repos** — re-run `nix run github:Runeword/lefthook -- --force`.
 
 Both paths render through the same module, so a scaffolded repository and one
 wired via `lib.mkShell` with the same hooks and the same `minVersion` produce
-byte-identical output. They differ by default in exactly that line: `mkShell`
-stamps this flake's `pkgs.lefthook.version`, while the scaffolder stamps the
-lefthook it found on your `PATH`.
+byte-identical output. Both stamp the feature floor by default, so that
+line matches too; the scaffolder additionally refuses to run if the lefthook on
+your `PATH` is below it.
+
+### The drift check
+
+A warning on entry is easy to miss, so the shell's passthru exposes the same
+flake check this repo runs on itself: `mkConfigCheck <src>` asserts that the
+committed `lefthook-generated.yml` in `<src>` byte-matches the shell's render
+(and that lefthook can load it), failing `nix flake check` until you run
+`lefthook-regen` and commit. `inputsFrom` does not carry passthru, so keep a
+handle on the inner shell:
+
+```nix
+let
+  lefthookShell = lefthook.lib.${pkgs.stdenv.hostPlatform.system}.mkShell {
+    lanes = [ "nix" "shell" ];
+  };
+in
+{
+  devShells.default = pkgs.mkShell { inputsFrom = [ lefthookShell ]; };
+  checks.lefthook-config = lefthookShell.mkConfigCheck self;
+}
+```
 
 ### `minVersion`
 
@@ -266,7 +300,10 @@ with no dev shell entered — the hook prints one line and **exits 0**, letting
 the commit through with every check skipped, secret scan included. This stamps
 `assert_lefthook_installed`, which turns that branch into an `exit 1`.
 `lefthook-init` gets the same protection without patching anything: the setting
-travels in the rendered config it writes, so any `lefthook install` bakes it in.
+travels in the rendered config it writes, so it is baked into the shim as soon as
+a root config `extends` that file — which the default path does for you. With
+`--adopt-existing-config` it applies only once you have added the `extends:`
+entry yourself and re-run `lefthook install`.
 
 It defaults to `true`, on the principle that a hook which checks nothing should
 say so rather than pass. Turn it off to restore lefthook's own default:
