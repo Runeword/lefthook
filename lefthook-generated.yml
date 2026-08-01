@@ -47,7 +47,7 @@ pre-commit:
               piped: true
             name: yaml
           - name: security-gitleaks
-            run: git diff --cached --text | gitleaks stdin --redact --verbose --no-banner --log-level=warn
+            run: security-gitleaks
         parallel: true
       name: main
     - name: auto-commit
