@@ -90,13 +90,18 @@ sparse=$(git config --bool --get core.sparseCheckout 2>/dev/null || echo false)
 # and replay them in cleanup — otherwise the hidden file reappears tracked and
 # the next "git add -A" stages the private change. Skipped under sparse, where
 # the S list is every excluded path and reapply already covers it.
+flags=$(git -c core.quotePath=false ls-files -v)
+# In a sparse checkout the skip-worktree set is every excluded path, and
+# "sparse-checkout reapply" in cleanup restores it — so only snapshot it when
+# there is no sparse machinery to do the job.
 skip_worktree_paths=""
-assume_unchanged_paths=""
 if [ "$sparse" != true ]; then
-  flags=$(git -c core.quotePath=false ls-files -v)
   skip_worktree_paths=$(printf '%s\n' "$flags" | sed -n 's/^[Ss] //p')
-  assume_unchanged_paths=$(printf '%s\n' "$flags" | sed -n 's/^[a-z] //p')
 fi
+# assume-unchanged has no such machinery: "reapply" does not restore it, so it
+# must be snapshotted in sparse checkouts as well or the "hide my local edit"
+# workflow breaks there exactly as it did everywhere else.
+assume_unchanged_paths=$(printf '%s\n' "$flags" | sed -n 's/^[a-z] //p')
 
 split_ok=0
 # Reached only through the EXIT trap installed below.
@@ -134,15 +139,57 @@ trap 'cleanup; trap - EXIT; exit 129' HUP
 # Reset the index to base without touching the working tree.
 git read-tree "$base"
 
-# Apply removals before additions so swapping a directory for a file (or a file
-# for a directory) never leaves the path in the index as both at once — git
-# refuses "'a' appears as both a file and a directory", which under set -e would
-# abort the split and wedge every retry. diff-tree emits the added file before
-# the deleted directory member, so reorder here.
-changes=$(
-  printf '%s\n' "$changes" | grep "^D$tab" || true
-  printf '%s\n' "$changes" | grep -v "^D$tab" || true
-)
+# Staging the file `a` fails while `a/b` is still in the index: git refuses with
+# "'a' appears as both a file and a directory", and under set -e that aborts the
+# split and wedges every retry. diff-tree emits `A a` before `D a/b`, so those
+# deletions have to be committed first.
+#
+# ONLY those. Moving every deletion ahead of every addition would split a rename
+# (`D old` + `A new`) so that the intermediate commit holds neither path, and a
+# bisect landing there sees the file simply missing. Everything else keeps
+# diff-tree's order, which emits the addition first.
+nl='
+'
+added_paths=$(printf '%s\n' "$changes" | sed -n "s/^A$tab//p")
+
+# True when one of the added paths is a parent directory of $1.
+under_added_path() {
+  _p=$1
+  while :; do
+    _parent=${_p%/*}
+    [ "$_parent" != "$_p" ] || return 1
+    case "$nl$added_paths$nl" in
+      *"$nl$_parent$nl"*) return 0 ;;
+    esac
+    _p=$_parent
+  done
+}
+
+conflicting=""
+ordered=""
+remaining_changes=$changes
+while [ "$remaining_changes" != "" ]; do
+  case $remaining_changes in
+    *"$nl"*)
+      line=${remaining_changes%%"$nl"*}
+      remaining_changes=${remaining_changes#*"$nl"}
+      ;;
+    *)
+      line=$remaining_changes
+      remaining_changes=""
+      ;;
+  esac
+  case $line in
+    "D$tab"*)
+      if under_added_path "${line#*"$tab"}"; then
+        conflicting="$conflicting$line$nl"
+        continue
+      fi
+      ;;
+  esac
+  ordered="$ordered$line$nl"
+done
+changes=$(printf '%s%s' "$conflicting" "$ordered")
 
 # Stage a single path's blob (mode + object id) from the snapshot tree.
 stage_one() {
