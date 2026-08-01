@@ -27,10 +27,11 @@ it exists so a *consumer's* `#!/bin/bash` script is not rejected outright.
 nix flake check                                    # eval + the config check below
 nix build .#checks.x86_64-linux.lefthook-config    # just that check
 nix build .#devShells.x86_64-linux.default.lefthookConfig  # render the config
-nix develop                                        # regenerates lefthook-generated.yml, installs hooks
+nix develop                                        # installs hooks; creates lefthook-generated.yml only if MISSING, else warns on drift
+lefthook-regen                                     # (inside the shell) rewrite lefthook-generated.yml after hooks.nix/mk-shell.nix changes
 
-# Regenerate the committed config WITHOUT entering the shell (which mutates the
-# repo and installs hooks):
+# Regenerate the committed config WITHOUT entering the shell (which installs
+# hooks):
 install -m 644 "$(nix build --no-link --print-out-paths \
   .#devShells.x86_64-linux.default.lefthookConfig)" lefthook-generated.yml
 
@@ -41,8 +42,14 @@ d=$(mktemp -d) && git -C "$d" init -q && (cd "$d" && nix run /home/charles/lefth
 
 There is no unit-test suite. `checks.lefthook-config` asserts the **committed**
 `lefthook-generated.yml` matches what the flake renders, and that lefthook can
-load it. Behavioural changes (auto-commit, the scaffolder, hook semantics) are
-verified empirically by driving real `git commit`s in throwaway repos under the
+load it; `checks.lefthook-all-lanes` renders *every* lane (the dev shell only
+covers four) and forces each hook's tools to instantiate, so a nixpkgs bump that
+breaks a tool this repo never builds fails here rather than at a consumer.
+Neither check enforces `min_version` or `assert_lefthook_installed` — `lefthook
+dump` merges without applying them; both bite at `run` time.
+
+Behavioural changes (auto-commit, the scaffolder, hook semantics) are verified
+empirically by driving real `git commit`s in throwaway repos under the
 scratchpad — never in this checkout, which has live hooks.
 
 ## Architecture
@@ -72,10 +79,15 @@ hooks.nix  ──►  mk-shell.nix  ──►  lefthook-generated.yml (committed
   config" step: writes `lefthook-generated.yml`, seeds `lefthook.yml`, keeps
   `lefthook-local.yml` out of the index, then `lefthook install`. Both the dev
   shell's `shellHook` and `lefthook-init` call it, so changing either path means
-  changing this file.
+  changing this file. The shellHook passes `--warn-drift`: an existing
+  generated config is never rewritten on entry, only created when missing —
+  drift gets a warning naming `lefthook-regen` (the same script in write mode,
+  on the shell `PATH`). `lefthook-init` and `lefthook-regen` use write mode.
 - **`mk-shell.nix`** — an `evalModules` module plus the renderer. Exposes
   `mkShell` (dev shell) and `toolchain` (the packages, for global installs);
-  both take the same arguments.
+  both take the same arguments. The shell's passthru carries `lefthookConfig`
+  (the render) and `mkConfigCheck` (the drift check, consumed by this flake's
+  own `checks.lefthook-config` and exportable to consumers).
 - **`init.nix` / `scripts/init.sh`** — the `lefthook-init` scaffolder, for
   repos with no dev shell.
 
@@ -90,16 +102,20 @@ lane blocks `auto-commit`.
   generated config machine-independent and therefore committable. Tools resolve
   from the dev-shell `PATH` (or a global install).
 - **`lefthook-generated.yml` is committed and must match what the flake
-  renders.** After changing `hooks.nix` or `mk-shell.nix`, regenerate it
-  (`nix develop` / `direnv reload`) or `nix flake check` fails on the `cmp`.
+  renders.** After changing `hooks.nix` or `mk-shell.nix`, regenerate it with
+  `lefthook-regen` (shell entry only *warns* on drift, it does not rewrite) or
+  `nix flake check` fails on the `cmp`.
 - **`min_version` must not exceed the lefthook that will *run* the hook.** A
   config demanding a newer lefthook than the runner fails hard at commit time —
   this has bitten repeatedly when a consumer's nixpkgs is older than this
   flake's. It defaults to `featureFloor` (a true lower bound every supported
   runner meets), **not** `pkgs.lefthook.version`, which would ratchet the demand
-  up on every `nix flake update`; `lefthook-init` overrides it with the runner
-  found on `PATH`. `mk-shell.nix` asserts `>= featureFloor` on render, so an
-  explicit too-low value throws. The floor is **1.13.0**: `jobs:` needs 1.10.0,
+  up on every `nix flake update`. `lefthook-init` stamps that same floor —
+  having first gated the runner it found against it — rather than the local
+  version, which would ratchet the demand up for everyone else on the team.
+  `mk-shell.nix` asserts `>= featureFloor` on render, so an explicit too-low
+  value throws. The value itself lives in `feature-floor.nix`, imported by both
+  sides so they cannot drift. The floor is **1.13.0**: `jobs:` needs 1.10.0,
   but below 1.13.0 the parallel lanes' post-format `git add` calls race
   `.git/index.lock` and `stage_fixed` silently drops the reformatted blobs (a
   warning, exit 0); older still, the runner ignores every job and exits 0. Both
@@ -109,8 +125,9 @@ lane blocks `auto-commit`.
   path before substituting; wrapping it in quotes of your own strips that
   escaping and turns a filename like `$(…).nix` into command injection. Put
   `--` before it instead, so a file named like a flag stays a file — except
-  for `zig fmt`, which rejects `--`, and the `lint-*` wrappers, which would
-  receive it as their own first argument.
+  for `zig fmt`, which rejects `--`, and the wrapper scripts (`lint-*`,
+  `security-opentofu`), which would receive it as their own first argument and
+  add it themselves when calling the real tool.
 - **`lanes` is all-or-nothing per lane**; opt a hook out with
   `hooks.<name>.enable = false`, which wins over what a lane implies.
 - **`scripts/*.sh` need `#!/bin/sh`** even though `writeShellApplication`
@@ -137,8 +154,12 @@ lane blocks `auto-commit`.
   top. There is no fix; `--no-verify` is the documented escape hatch.
 - **`auto-commit` must restore what `read-tree` destroys.** Rebuilding the
   index drops skip-worktree bits (in a sparse checkout every excluded path then
-  reads as deleted to the next `git add -A`) and the stat cache. The `cleanup`
-  trap puts both back on the success *and* failure paths.
+  reads as deleted to the next `git add -A`), `--assume-unchanged` bits, and the
+  stat cache. The `cleanup` trap puts them back on the success *and* failure
+  paths. Two traps for the price of one: `sparse-checkout reapply` restores
+  skip-worktree only, so assume-unchanged is snapshotted separately **including**
+  in sparse checkouts; and bash does not run an `EXIT` trap when it dies of a
+  group `SIGINT`, so `INT`/`TERM`/`HUP` are trapped explicitly.
 - **`auto-commit` must pass through** when git is not operating on the real
   index (`GIT_INDEX_FILE` ending in `.lock`, i.e. `git commit -a` and pathspec
   commits) or when a merge/squash-merge/cherry-pick/revert/rebase is in
