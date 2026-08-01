@@ -335,10 +335,14 @@ if { [ -e lefthook-generated.yml ] || [ -L lefthook-generated.yml ]; } &&
   echo "lefthook-init: lefthook-generated.yml already exists and differs; re-run with --force to replace it" >&2
   exit 1
 fi
-# Decided before wire-repo runs, since it is what creates the file.
-created_root_config=false
-if ! { [ -e lefthook.yml ] || [ -L lefthook.yml ]; }; then
-  created_root_config=true
+# Snapshot before wire-repo, which is what creates the file — a snapshot only:
+# whether it actually created one is observed after it runs, since it seeds
+# nothing when the repository already has a main config under one of the other
+# names lefthook loads. `-e` alone, no `-L`: a dangling lefthook.yml symlink is
+# not a config, and wire-repo unlinks it and writes a real one in its place.
+root_config_existed=false
+if [ -e lefthook.yml ]; then
+  root_config_existed=true
 fi
 
 if [ "$adopted_foreign_config" = true ] && [ "$adopt" = false ]; then
@@ -429,7 +433,7 @@ if git check-ignore -q -- lefthook-generated.yml; then
   exit 1
 fi
 
-if [ "$created_root_config" = true ] && git check-ignore -q -- lefthook.yml; then
+if [ "$root_config_existed" = false ] && git check-ignore -q -- lefthook.yml; then
   echo "lefthook-init: lefthook.yml is ignored by: $(git check-ignore -v -- lefthook.yml 2>/dev/null || true)" >&2
   echo "lefthook-init: it has to be committed for the hooks to travel with the repository." >&2
   echo "lefthook-init: drop that ignore rule, then re-run. NO hooks were installed." >&2
@@ -438,12 +442,26 @@ fi
 
 wire-repo "$rendered" "$runner"
 
+# Observed, not predicted: wire-repo seeds lefthook.yml only when the repository
+# has no main config at all, so staging it on the strength of the pre-check above
+# would abort this script — errexit, on git's "pathspec did not match any files"
+# — AFTER the hooks were installed, swallowing both the summary below and the
+# warning that the generated hooks are inactive. The two disagreed in the other
+# direction too: a dangling lefthook.yml symlink reads as "existed" to that
+# check, but wire-repo replaces it, and the real config it wrote went unstaged.
+created_root_config=false
+if [ "$root_config_existed" = false ] && [ -e lefthook.yml ]; then
+  created_root_config=true
+fi
+
 git add -- lefthook-generated.yml
 if [ "$created_root_config" = true ]; then
   git add -- lefthook.yml
   wrote="lefthook-generated.yml, lefthook.yml (staged — commit them)"
-else
+elif [ "$root_config_existed" = true ]; then
   wrote="lefthook-generated.yml (staged — commit it); kept your existing lefthook.yml"
+else
+  wrote="lefthook-generated.yml (staged — commit it); no lefthook.yml created (see the warning above)"
 fi
 
 # With an existing lefthook.yml kept (the --adopt path), the generated hooks run
@@ -474,9 +492,18 @@ lefthook-init: done.
 EOF
 
 if [ "$generated_active" = false ]; then
-  echo "lefthook-init: WARNING: your lefthook.yml does not extend lefthook-generated.yml, so the" >&2
-  echo "lefthook-init: generated hooks (gitleaks, formatters, auto-commit) are NOT active. Add:" >&2
+  # Not always lefthook.yml: when the repository ships its main config under one
+  # of the other names lefthook loads, wire-repo leaves lefthook.yml uncreated
+  # and names that file in the warning it printed above. Naming it again here
+  # would mean repeating wire-repo's search, so point at that warning instead.
+  if [ -e lefthook.yml ]; then
+    extends_target="your lefthook.yml"
+  else
+    extends_target="the config named in the warning above"
+  fi
+  echo "lefthook-init: WARNING: $extends_target does not extend lefthook-generated.yml, so" >&2
+  echo "lefthook-init: the generated hooks (gitleaks, formatters, auto-commit) are NOT active. Add:" >&2
   echo "lefthook-init:     extends:" >&2
   echo "lefthook-init:       - lefthook-generated.yml" >&2
-  echo "lefthook-init: to your lefthook.yml, then re-run 'lefthook install'." >&2
+  echo "lefthook-init: to that file, then re-run 'lefthook install'." >&2
 fi
