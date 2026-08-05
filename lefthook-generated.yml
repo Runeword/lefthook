@@ -17,15 +17,11 @@ pre-commit:
             name: nix
           - group:
               jobs:
-                - glob: '*.sh'
+                - glob: '*.{sh,bash}'
                   name: shfmt
                   run: shfmt --write --indent 2 --case-indent --language-dialect auto --simplify -- {staged_files}
                   stage_fixed: true
-                - glob: '*.sh'
-                  name: shellharden
-                  run: shellharden --replace -- {staged_files}
-                  stage_fixed: true
-                - glob: '*.sh'
+                - glob: '*.{sh,bash}'
                   name: lint-shell
                   run: shellcheck -- {staged_files}
               piped: true
