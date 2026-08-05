@@ -161,33 +161,27 @@ in
     ];
   };
 
-  # The shell lane pipes two formatters (shfmt, then shellharden) before lint.
+  # The shell lane formats with shfmt, then lints with shellcheck.
   # `--diff` is intentionally dropped from shfmt: it makes shfmt exit non-zero
-  # whenever it reformats, which would abort the piped lane before shellharden.
+  # whenever it reformats, which would abort the piped lane before lint runs.
   # `--language-dialect auto` (not `posix`): shfmt reads the shebang, so a
   # consumer's `#!/bin/bash` script is formatted as bash while this repo's own
   # `#!/bin/sh` scripts still get POSIX treatment. Hard-coding `posix` made
   # shfmt exit 1 on any bash feature (arrays, `[[ ]]`) in a `*.sh` file — the
   # standard bash extension — so a scaffolded repo could not commit those files.
+  #
+  # shellharden was REMOVED from this lane and must not be re-added; see the
+  # "no auto-fixer may outrank its own linter" invariant in CLAUDE.md.
   format-shell = {
     lane = "shell";
     order = 0;
-    tools = [
-      pkgs.shfmt
-      pkgs.shellharden
-    ];
+    tools = [ pkgs.shfmt ];
     jobs = [
       {
         name = "shfmt";
-        glob = "*.sh";
+        glob = "*.{sh,bash}";
         stage_fixed = true;
         run = "shfmt --write --indent 2 --case-indent --language-dialect auto --simplify -- {staged_files}";
-      }
-      {
-        name = "shellharden";
-        glob = "*.sh";
-        stage_fixed = true;
-        run = "shellharden --replace -- {staged_files}";
       }
     ];
   };
@@ -199,7 +193,7 @@ in
     jobs = [
       {
         name = "lint-shell";
-        glob = "*.sh";
+        glob = "*.{sh,bash}";
         run = "shellcheck -- {staged_files}";
       }
     ];
