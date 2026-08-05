@@ -16,7 +16,7 @@
 # lane:regex — the file extensions each lane's hooks glob for. Single source of
 # truth for detection, for validating --lanes, and for --help.
 lane_probes='go:\.go$ lua:\.lua$ nix:\.nix$ opentofu:\.(tf|tofu|tfvars)$'
-lane_probes=$lane_probes' rust:\.rs$ shell:\.sh$ toml:\.toml$'
+lane_probes=$lane_probes' rust:\.rs$ shell:\.(sh|bash)$ toml:\.toml$'
 lane_probes=$lane_probes' yaml:\.(yml|yaml)$ zig:\.(zig|zon)$'
 all_lanes=$(printf '%s\n' "$lane_probes" | tr ' ' '\n' | sed 's/:.*//' | tr '\n' ' ')
 # The trailing space `tr` leaves would make `case " $all_lanes "` contain a
@@ -144,8 +144,10 @@ if [ "$lanes" = "" ]; then
   files=$(list_files)
   detected=""
   # Consumed field by field rather than with `for probe in $lane_probes`,
-  # which relies on unquoted word splitting, or a heredoc: both get rewritten
-  # by shellharden into something that no longer means this.
+  # which relies on unquoted word splitting, or a heredoc. shellharden no
+  # longer runs in the shell lane, but it is still the documented by-hand tool
+  # and rewrites both of those into something that means something else, so
+  # this idiom stays.
   remaining_probes=$lane_probes
   while [ "$remaining_probes" != "" ]; do
     case $remaining_probes in
