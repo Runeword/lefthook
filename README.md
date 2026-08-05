@@ -177,7 +177,7 @@ cannot drift with how the attrset happens to be enumerated.
 | `nix`      | `format-nix`, `lint-nix`                                  |
 | `opentofu` | `format-opentofu`, `lint-opentofu`, `security-opentofu`  |
 | `rust`     | `format-rust`                                             |
-| `shell`    | `format-shell` (shfmt + shellharden), `lint-shell`       |
+| `shell`    | `format-shell` (shfmt), `lint-shell`                      |
 | `toml`     | `format-toml`                                             |
 | `yaml`     | `format-yaml`                                             |
 | `zig`      | `format-zig`                                              |
@@ -189,7 +189,8 @@ cannot drift with how the attrset happens to be enumerated.
 - `LEFTHOOK_EXCLUDE=auto-commit git commit …` skips one job by name (works for
   nested jobs) — the practical way to get a single commit with your own
   message. It matches **job** names, not the hook names in the table above:
-  the `format-shell` hook contributes two jobs, `shfmt` and `shellharden`.
+  the `format-shell` hook contributes a job named `shfmt`, so excluding it
+  takes `LEFTHOOK_EXCLUDE=shfmt`, not `LEFTHOOK_EXCLUDE=format-shell`.
 - `git commit --amend --no-verify` is the way to amend, and the same goes for
   `git commit --fixup=<sha>`: a pre-commit hook cannot detect either (the
   environment is byte-identical to a normal commit), so without `--no-verify`
