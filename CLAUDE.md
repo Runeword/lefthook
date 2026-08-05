@@ -16,8 +16,8 @@ normal commit instead.
 
 Committing also runs this repo's formatters and linters on the staged files and
 **blocks the commit** if they fail (`nixfmt`, `deadnix`, `statix` for Nix;
-`shfmt --language-dialect auto`, `shellharden`, `shellcheck` for
-`scripts/*.sh`). Run them before committing rather than discovering it mid-hook.
+`shfmt --language-dialect auto`, `shellcheck` for `scripts/*.sh`). Run them
+before committing rather than discovering it mid-hook.
 `auto` reads the shebang, so these `#!/bin/sh` scripts are still held to POSIX —
 it exists so a *consumer's* `#!/bin/bash` script is not rejected outright.
 
@@ -142,13 +142,26 @@ lane blocks `auto-commit`.
   use `grep pat >/dev/null`, which reads to EOF. And a bare `dirname "$f"`
   failing on an odd filename aborts the whole pipeline rather than that one
   iteration.
-- **shellharden rewrites two constructs into something else.** `for x in $list`
-  becomes `for x in "$list"` (one iteration, SC2066) or a bash array; and it
-  inserts literal quote characters *inside* heredoc bodies. Iterate by
-  consuming a string with `${v%% *}` / `${v#* }` instead — see the probe loop
-  in `scripts/init.sh`. Always re-run the repo's exact
-  `shfmt --indent 2 --case-indent --language-dialect auto --simplify`,
-  `shellharden --replace` and `shellcheck` after editing, in that order.
+- **No auto-fixer may outrank its own linter — why `shellharden` is gone.** It
+  was removed from the shell lane on 2026-08-05 and must not be re-added. It
+  rewrites `for x in $list` into `for x in "${list[@]}"`; on a plain string in a
+  `#!/bin/bash` file that goes from N iterations to **one**, and the damage is
+  invisible to every guard in the lane — `shellcheck` exits 0 on the result
+  (it is a bash array, perfectly legal), so `stage_fixed: true` `git add`s the
+  rewrite and the commit succeeds with silently changed behaviour. Reproduce
+  with a three-word `list=` and a `for x in $list` loop. Note the construct it
+  breaks is one `shellcheck` deliberately *permits* (intentional word
+  splitting), so this was its only unique contribution to the lane.
+  `shellcheck` remains the detector for what actually matters (SC2086 → exit 1,
+  commit blocked), so nothing was lost. `--check` is not a substitute: it prints
+  **no output**, only exit 2. The general rule this encodes: a tool that mutates
+  source *and* auto-stages the result must be strictly more trustworthy than the
+  linter that follows it, because anything it breaks past that linter's notice
+  lands in history unreviewed. `shfmt` clears that bar; `shellharden` did not.
+  It is still a fine thing to run **by hand** — it just cannot hold the pen on a
+  commit. Its heredoc rewrite (inserting literal quotes into heredoc bodies) and
+  the `${v%% *}` / `${v#* }` iteration idiom in `scripts/init.sh` are unaffected;
+  that idiom is still correct POSIX and worth keeping.
 - **`auto-commit` cannot see `--amend` or `--fixup`.** The hook environment is
   byte-identical to a normal commit, so both get rewritten into new commits on
   top. There is no fix; `--no-verify` is the documented escape hatch.
