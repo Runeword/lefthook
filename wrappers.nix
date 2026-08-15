@@ -25,8 +25,10 @@ in
   auto-commit = pkgs.writeShellApplication {
     name = "auto-commit";
     # sed and grep are used by the skip-worktree snapshot and the
-    # deletions-before-additions reorder, not just git.
+    # deletions-before-additions reorder; coreutils' cat/rm by the "--prepare"
+    # predirty snapshot — not just git.
     runtimeInputs = [
+      pkgs.coreutils
       pkgs.git
       pkgs.gnugrep
       pkgs.gnused
