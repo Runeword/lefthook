@@ -265,6 +265,23 @@ in
     # exporting GIT_CONFIG_GLOBAL for identity), breaking `git commit` from the
     # shell. The script bakes in its own git via runtimeInputs.
     tools = [ wrappers.auto-commit ];
+    # A second job the renderer places at the HEAD of the piped pre-commit, so it
+    # runs before any formatter. It snapshots which staged files already carry
+    # unstaged changes; the finalize job below reads that to fold an in-hook
+    # reformat into the split commits while preserving partial staging. Needed
+    # because lefthook >= 2.1.7 defers `stage_fixed` to after finalize jobs, so
+    # the index the finalize job sees would otherwise still hold the pre-format
+    # blob. See scripts/auto-commit.sh.
+    prepareJobs = [
+      {
+        name = "auto-commit-prepare";
+        run = "auto-commit --prepare";
+        skip = [
+          "merge"
+          "rebase"
+        ];
+      }
+    ];
     jobs = [
       {
         name = "auto-commit";
