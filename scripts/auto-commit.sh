@@ -2,14 +2,19 @@
 # Split the staged index into one commit per file with a generated message,
 # then abort the umbrella commit.
 #
-# Each file is committed from its STAGED blob (not the working tree), so
+# A file that was CLEAN at hook start (worktree == index) is committed from its
+# WORKTREE blob, so a formatter's in-hook fix is folded in no matter when
+# lefthook stages it — lefthook >= 2.1.7 defers "stage_fixed" to AFTER this
+# finalize job, leaving the index alone still holding the pre-format blob. A
+# file that ALREADY had unstaged changes is committed from its STAGED blob, so
 # partial staging ("git add -p") is preserved: unstaged hunks stay uncommitted.
-# Formatters re-stage their fixes via lefthook's "stage_fixed" before this runs,
-# so the index already holds the final content.
+# The two are told apart by the "--prepare" pass below, which must run as the
+# FIRST pre-commit job, before any formatter touches the worktree.
 #
-# Runs as lefthook's "finalize" job. On success it exits 1 to cancel the
-# original "git commit" (whose files are now committed individually) — so
-# "git commit" always reports failure even though every commit went through.
+# Runs as lefthook's "finalize" job (its "--prepare" sibling runs first). On
+# success it exits 1 to cancel the original "git commit" (whose files are now
+# committed individually) — so "git commit" always reports failure even though
+# every commit went through.
 
 # Prevent recursion: the per-file "git commit" calls below re-enter the hook.
 # Namespaced because a bare AUTO_COMMIT in the environment would silently
@@ -18,12 +23,25 @@ if [ "${LEFTHOOK_AUTO_COMMIT_SPLITTING:-}" = "1" ]; then
   exit 0
 fi
 
+git_dir=$(git rev-parse --git-dir)
+predirty_file="$git_dir/lefthook-ac-predirty"
+
+# "--prepare" runs as the FIRST pre-commit job, before any formatter. It records
+# the staged paths that ALREADY carry unstaged changes, so the finalize pass can
+# tell a formatter's in-hook edit (fold into the commit) from a deliberate
+# partial stage (leave the excluded hunks out). quotePath=false so these match
+# the diff-tree paths the finalize pass compares them against. The redirect
+# always creates the file, so a later MISSING file means this pass never ran.
+if [ "${1:-}" = "--prepare" ]; then
+  git -c core.quotePath=false diff --name-only >"$predirty_file" 2>/dev/null || true
+  exit 0
+fi
+
 # A merge, squash-merge, cherry-pick, revert, or rebase in progress must
 # conclude as the single commit git expects: the first per-file commit below
 # would consume its state (e.g. MERGE_HEAD) and record a history that never
 # happened. SQUASH_MSG covers "git merge --squash", which sets no MERGE_HEAD
 # and whose whole purpose is to land as one commit.
-git_dir=$(git rev-parse --git-dir)
 for state in MERGE_HEAD SQUASH_MSG CHERRY_PICK_HEAD REVERT_HEAD rebase-merge rebase-apply; do
   if [ -e "$git_dir/$state" ]; then
     exit 0
@@ -103,6 +121,20 @@ fi
 # workflow breaks there exactly as it did everywhere else.
 assume_unchanged_paths=$(printf '%s\n' "$flags" | sed -n 's/^[a-z] //p')
 
+# Which staged paths already had unstaged changes when the hook started (from
+# the "--prepare" pass). A path NOT listed was clean then, so its current
+# worktree blob is exactly "what was staged, plus any formatter fix" — safe to
+# fold in. A listed path keeps its staged blob, preserving partial staging. If
+# the file is absent the prepare pass never ran: fall back to staged blobs so
+# behaviour never regresses below today's.
+if [ -f "$predirty_file" ]; then
+  predirty=$(cat "$predirty_file")
+  have_predirty=1
+else
+  predirty=""
+  have_predirty=0
+fi
+
 split_ok=0
 # Reached only through the EXIT trap installed below.
 # shellcheck disable=SC2329
@@ -126,6 +158,8 @@ cleanup() {
     done
   fi
   git update-index -q --refresh >/dev/null 2>&1 || true
+  # Per-run scratch from the "--prepare" pass; drop it whichever way we leave.
+  rm -f "$predirty_file" 2>/dev/null || true
 }
 trap cleanup EXIT
 # bash does NOT run the EXIT trap when it dies from a SIGINT delivered to the
@@ -191,14 +225,47 @@ while [ "$remaining_changes" != "" ]; do
 done
 changes=$(printf '%s%s' "$conflicting" "$ordered")
 
-# Stage a single path's blob (mode + object id) from the snapshot tree.
+# True when $1 was recorded as already-dirty by the "--prepare" pass.
+is_predirty() {
+  case "$nl$predirty$nl" in
+    *"$nl$1$nl"*) return 0 ;;
+  esac
+  return 1
+}
+
+# True for a regular-file mode (100644 or 100755). A symlink (120000) or gitlink
+# (160000) is EXCLUDED from the worktree-blob branch below. "git hash-object"
+# FOLLOWS a staged symlink and hashes its TARGET file's contents (unlike
+# "git add"/update-index, which lstat and store the link-target string), so a
+# symlink pointing at a local secret would fold that secret's bytes into the
+# commit; and it would error on a gitlink's worktree directory, aborting the
+# split under "set -e". Neither is ever reformatted in-hook, so its staged blob
+# is always the correct source.
+is_regular_mode() {
+  case "$1" in
+    100644 | 100755) return 0 ;;
+  esac
+  return 1
+}
+
+# Stage a single path (mode + object id). The mode always comes from the
+# snapshot tree — formatters do not change it. The blob comes from the snapshot
+# too (its staged blob), EXCEPT for a regular file that was clean at hook start,
+# whose worktree blob is taken instead so an in-hook reformat lands in this
+# commit.
 stage_one() {
   # ":(literal)" because ls-tree takes a PATHSPEC: a staged name containing *,
   # ? or [ would otherwise match sibling entries too and ${_mode%% *} would take
   # the first one's mode. (rev-parse "<tree>:<path>" below is already literal.)
   _mode=$(git ls-tree "$staged_tree" -- ":(literal)$1")
   _mode=${_mode%% *}
-  _oid=$(git rev-parse "$staged_tree:$1")
+  if [ "$have_predirty" = 1 ] && ! is_predirty "$1" && is_regular_mode "$_mode"; then
+    # hash-object -w applies clean filters (as "git add" would) and writes the
+    # blob to the object db so update-index can reference it.
+    _oid=$(git hash-object -w -- "$1")
+  else
+    _oid=$(git rev-parse "$staged_tree:$1")
+  fi
   git update-index --add --cacheinfo "$_mode" "$_oid" "$1"
 }
 
