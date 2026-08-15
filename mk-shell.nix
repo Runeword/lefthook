@@ -169,14 +169,21 @@ let
       # Sorted by `order`, not attribute name — validFinalizeOrders requires one
       # as soon as there is more than a single finalize hook to sequence.
       finalizeJobs = concatMap (h: h.jobs) (sort (a: b: (a.order or 0) < (b.order or 0)) finalize);
+      # Jobs an enabled hook contributes to the HEAD of the piped pre-commit,
+      # before `main`, so they observe the worktree before any formatter touches
+      # it (auto-commit's `--prepare` snapshot). A single source today, so
+      # attribute order is deterministic without an ordering validator like the
+      # finalize one; add that guard here if a second hook ever contributes.
+      prepareJobs = concatMap (h: h.prepareJobs or [ ]) enabled;
     in
     {
       piped = true;
       # `main` is omitted when empty (e.g. only auto-commit enabled): lefthook
-      # errors out on a group with no jobs. Finalize jobs follow it directly,
-      # sequenced by the top-level `piped`.
+      # errors out on a group with no jobs. Prepare jobs lead it and finalize
+      # jobs follow, all sequenced by the top-level `piped`.
       jobs =
-        optional (mainJobs != [ ]) {
+        prepareJobs
+        ++ optional (mainJobs != [ ]) {
           name = "main";
           group = {
             parallel = true;
