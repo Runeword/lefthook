@@ -2,6 +2,11 @@ assert_lefthook_installed: true
 min_version: 1.13.0
 pre-commit:
   jobs:
+    - name: auto-commit-prepare
+      run: auto-commit --prepare
+      skip:
+        - merge
+        - rebase
     - group:
         jobs:
           - group:
