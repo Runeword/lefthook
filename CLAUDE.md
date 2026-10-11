@@ -165,14 +165,33 @@ lane blocks `auto-commit`.
 - **`auto-commit` cannot see `--amend` or `--fixup`.** The hook environment is
   byte-identical to a normal commit, so both get rewritten into new commits on
   top. There is no fix; `--no-verify` is the documented escape hatch.
-- **`auto-commit` must restore what `read-tree` destroys.** Rebuilding the
-  index drops skip-worktree bits (in a sparse checkout every excluded path then
-  reads as deleted to the next `git add -A`), `--assume-unchanged` bits, and the
-  stat cache. The `cleanup` trap puts them back on the success *and* failure
-  paths. Two traps for the price of one: `sparse-checkout reapply` restores
-  skip-worktree only, so assume-unchanged is snapshotted separately **including**
-  in sparse checkouts; and bash does not run an `EXIT` trap when it dies of a
-  group `SIGINT`, so `INT`/`TERM`/`HUP` are trapped explicitly.
+- **`auto-commit` never rewrites the real index mid-split.** The per-file
+  commits are built in a private `GIT_INDEX_FILE` (`.git/lefthook-split.*/`).
+  Anything can hold `.git/index.lock` at any moment (a `git status` in another
+  terminal, magit, a prompt), and the old in-place split then failed partway;
+  its restore hit the same lock and wiped the staging, with exit 1 like a
+  success. The snapshot is taken from a *copy* of the real index (even
+  `write-tree` takes the lock). The only write to the real index is at the end:
+  `--index-info` for the blobs the fold took from the worktree, retried while
+  the lock is busy, and only where HEAD holds them. Skip-worktree and
+  assume-unchanged bits and the stat cache survive because nothing touches
+  them. Do not reintroduce a `read-tree` or per-path `update-index` on the real
+  index. Two consequences hold the design together:
+  - With the real index free, nothing locks out a concurrent commit, checkout
+    or reset. Before each commit the loop checks that HEAD is still where it
+    left it, or the commit would revert whatever moved HEAD. The check is one
+    `rev-parse HEAD 'HEAD^@'`, and the raw `diff-tree` output carries
+    mode+blob, so the split spawns no more processes than before.
+  - The loop must run in the main shell (reading a file, not a pipe). A pipeline
+    subshell let the INT trap delete the private index while a `git commit` was
+    still reading it, and git took the missing index for an empty one: it
+    committed a tree with every file deleted.
+
+  Stopping partway (an error, ^C, TERM, even SIGKILL) therefore leaves exactly
+  the uncommitted files staged. bash does not run an `EXIT` trap when it dies
+  of a group `SIGINT`, so `INT`/`TERM`/`HUP` are trapped explicitly. lefthook
+  SIGKILLs a job on ^C, so no trap runs there, which is why each run sweeps
+  split dirs left idle for an hour.
 - **`auto-commit` must pass through** when git is not operating on the real
   index (`GIT_INDEX_FILE` ending in `.lock`, i.e. `git commit -a` and pathspec
   commits) or when a merge/squash-merge/cherry-pick/revert/rebase is in
