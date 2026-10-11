@@ -24,13 +24,14 @@ in
 {
   auto-commit = pkgs.writeShellApplication {
     name = "auto-commit";
-    # sed and grep are used by the skip-worktree snapshot and the
-    # deletions-before-additions reorder; coreutils' cat/rm by the "--prepare"
-    # predirty snapshot — not just git.
+    # Not just git: sed for the deletions-before-additions reorder, coreutils'
+    # mktemp/cp/rm/sleep for the private index and its lock retry, find to sweep
+    # the private indexes of killed splits, and cat for the "--prepare" predirty
+    # snapshot.
     runtimeInputs = [
       pkgs.coreutils
+      pkgs.findutils
       pkgs.git
-      pkgs.gnugrep
       pkgs.gnused
     ];
     text = builtins.readFile ./scripts/auto-commit.sh;
