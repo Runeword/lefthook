@@ -222,6 +222,11 @@ Consequences worth knowing:
   (and the umbrella commit message is discarded).
 - Each file is committed from its **staged** blob, so partial staging
   (`git add -p`) is preserved: unstaged hunks stay in the working tree.
+- The split builds its commits in a private index, so other git activity
+  meanwhile (a `git status` in another terminal, an editor's git integration)
+  cannot break it. If it stops partway (an error, ^C, or another commit moving
+  `HEAD`), whatever it did not commit is still staged; `git commit` again
+  continues.
 - Situations where splitting would corrupt history pass through untouched as
   one normal commit: concluding a merge, squash-merge, cherry-pick, revert, or
   rebase; `git commit -a` / pathspec commits (git runs those against a
