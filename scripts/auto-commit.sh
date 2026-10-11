@@ -11,6 +11,14 @@
 # The two are told apart by the "--prepare" pass below, which must run as the
 # FIRST pre-commit job, before any formatter touches the worktree.
 #
+# The commits are built in a PRIVATE index file, never in the real one: any
+# other git process may lock the real index mid-split (a "git status" in
+# another terminal, an editor's git integration, a shell prompt), and a split
+# rebuilding it would then fail partway with the staging half dismantled. The
+# real index keeps the staging throughout, so a split that stops partway leaves
+# whatever it did not commit still staged. Its one write comes at the end,
+# staging the formatter fixes folded in above.
+#
 # Runs as lefthook's "finalize" job (its "--prepare" sibling runs first). On
 # success it exits 1 to cancel the original "git commit" (whose files are now
 # committed individually) — so "git commit" always reports failure even though
@@ -62,20 +70,88 @@ if git diff --cached --quiet; then
 fi
 
 # Base to diff the snapshot against: HEAD, or the empty tree on the first commit.
-if git rev-parse --verify --quiet HEAD >/dev/null; then
-  base=HEAD
+# Resolved once: the loop also checks that HEAD is still here before its first
+# commit.
+if start_head=$(git rev-parse --verify --quiet HEAD); then
+  base=$start_head
 else
+  start_head=""
   base=$(git hash-object -t tree /dev/null)
 fi
 
-# Snapshot the current index; we rebuild it one path at a time from this tree.
-staged_tree=$(git write-tree)
+tab=$(printf '\t')
 
-# Walk the snapshot's changes vs base. --no-renames keeps every entry to a
-# single-letter status plus one path; core.quotePath=false keeps UTF-8 and
-# spaces literal. Collected before the index is touched so an unsupported path
-# can bail out while there is still nothing to undo.
-changes=$(git -c core.quotePath=false diff-tree -r --no-renames --name-status "$base" "$staged_tree")
+# The private index, in a directory of its own: unique per run, so two splits
+# at once never share one, and absolute so it still resolves from a hook that
+# changes directory. A split killed outright (lefthook SIGKILLs a job on ^C)
+# cannot remove its own, so first sweep any left idle for an hour; a live one
+# is touched by every commit it makes.
+abs_git_dir=$(git rev-parse --absolute-git-dir)
+find "$abs_git_dir" -maxdepth 1 -type d -name 'lefthook-split.*' -mmin +60 -exec rm -rf -- {} + 2>/dev/null || true
+split_dir=$(mktemp -d "$abs_git_dir/lefthook-split.XXXXXX")
+split_index=$split_dir/index
+# One "mode oid<TAB>path" line per path staged from the worktree rather than
+# the index; cleanup stages in the real index the ones HEAD ends up holding.
+folded=$split_dir/folded
+
+splitting=0
+split_done=0
+# Reached only through the traps installed below.
+# shellcheck disable=SC2329
+cleanup() {
+  if [ "$splitting" = 1 ] && [ "$split_done" = 0 ]; then
+    echo "auto-commit: split stopped; whatever it did not commit is still staged" >&2
+  fi
+  # The real index still holds the pre-format blob of every file committed
+  # from the worktree; left alone, the next commit would revert those fixes.
+  # Only where HEAD still holds the committed blob, though: after a checkout or
+  # reset elsewhere the index describes some other commit. This is the only
+  # write to the real index, so it waits out whoever holds the lock.
+  if [ -s "$folded" ]; then
+    while IFS= read -r _entry; do
+      _oid=${_entry%%"$tab"*}
+      if [ "$(git rev-parse --verify --quiet "HEAD:${_entry#*"$tab"}" || true)" = "${_oid#* }" ]; then
+        printf '%s\n' "$_entry"
+      fi
+    done <"$folded" >"$split_dir/stage"
+    _tries=0
+    while [ -s "$split_dir/stage" ] && ! _err=$(git update-index --index-info <"$split_dir/stage" 2>&1); do
+      _tries=$((_tries + 1))
+      if [ "$_tries" -ge 50 ]; then
+        printf '%s\n' "$_err" >&2
+        echo "auto-commit: formatter fixes committed but not staged (git add to stage them):" >&2
+        sed "s/^[^$tab]*$tab/  /" "$split_dir/stage" >&2 || true
+        break
+      fi
+      sleep 0.1
+    done
+  fi
+  rm -rf "$split_dir" 2>/dev/null || true
+  # Per-run scratch from the "--prepare" pass; drop it whichever way we leave.
+  rm -f "$predirty_file" 2>/dev/null || true
+}
+trap cleanup EXIT
+# bash does NOT run the EXIT trap when it dies from a SIGINT delivered to the
+# foreground process group (^C at the terminal), which would leave the folded
+# fixes unstaged. Clean up explicitly, then disarm EXIT so cleanup does not run
+# twice.
+trap 'cleanup; trap - EXIT; exit 130' INT
+trap 'cleanup; trap - EXIT; exit 143' TERM
+trap 'cleanup; trap - EXIT; exit 129' HUP
+
+# Snapshot the staging from a copy of the real index. git replaces that file
+# atomically, so the copy is always whole, and write-tree then locks the copy
+# rather than contending for the real index's lock.
+cp -- "$(git rev-parse --git-path index)" "$split_index"
+staged_tree=$(GIT_INDEX_FILE=$split_index git write-tree)
+
+# Walk the snapshot's changes vs base, one raw line per path:
+# ":oldmode newmode oldoid newoid STATUS<TAB>path", so the loop has each path's
+# staged mode and blob without asking git again. --no-renames keeps every entry
+# to a single-letter status plus one path; core.quotePath=false keeps UTF-8 and
+# spaces literal. Collected up front so an unsupported path can bail out before
+# anything is committed.
+changes=$(git -c core.quotePath=false diff-tree -r --no-renames "$base" "$staged_tree")
 
 # Guard the loop below: printing an empty list still yields one blank line,
 # which would read back as an empty path.
@@ -87,39 +163,12 @@ fi
 # C-quoted, and feeding that back to git fails partway through — committing the
 # paths that sort before it and wedging every retry. Hand the whole commit to
 # git untouched instead.
-tab=$(printf '\t')
 case $changes in
   *"$tab"'"'*)
     echo "auto-commit: tab, newline, quote or backslash in a staged filename is unsupported; committing as one commit" >&2
     exit 0
     ;;
 esac
-
-# Restoring the index costs its stat cache and, in a sparse checkout, its
-# skip-worktree bits — which would make every excluded path read as deleted to
-# the next "git add -A". Put both back whichever way we leave. --bool so git's
-# other truthy spellings (1, yes, on) are read as sparse too.
-sparse=$(git config --bool --get core.sparseCheckout 2>/dev/null || echo false)
-
-# read-tree below also drops manually-set skip-worktree and assume-unchanged
-# bits. A sparse checkout gets skip-worktree back via "sparse-checkout reapply";
-# a plain "git update-index --skip-worktree" / "--assume-unchanged" (the "hide
-# my local edit" workflow) has no such machinery, so snapshot those paths now
-# and replay them in cleanup — otherwise the hidden file reappears tracked and
-# the next "git add -A" stages the private change. Skipped under sparse, where
-# the S list is every excluded path and reapply already covers it.
-flags=$(git -c core.quotePath=false ls-files -v)
-# In a sparse checkout the skip-worktree set is every excluded path, and
-# "sparse-checkout reapply" in cleanup restores it — so only snapshot it when
-# there is no sparse machinery to do the job.
-skip_worktree_paths=""
-if [ "$sparse" != true ]; then
-  skip_worktree_paths=$(printf '%s\n' "$flags" | sed -n 's/^[Ss] //p')
-fi
-# assume-unchanged has no such machinery: "reapply" does not restore it, so it
-# must be snapshotted in sparse checkouts as well or the "hide my local edit"
-# workflow breaks there exactly as it did everywhere else.
-assume_unchanged_paths=$(printf '%s\n' "$flags" | sed -n 's/^[a-z] //p')
 
 # Which staged paths already had unstaged changes when the hook started (from
 # the "--prepare" pass). A path NOT listed was clean then, so its current
@@ -135,43 +184,8 @@ else
   have_predirty=0
 fi
 
-split_ok=0
-# Reached only through the EXIT trap installed below.
-# shellcheck disable=SC2329
-cleanup() {
-  if [ "$split_ok" -eq 0 ]; then
-    # The split failed partway: put the original staging back so nothing is lost.
-    git read-tree "$staged_tree" 2>/dev/null || true
-  fi
-  if [ "$sparse" = true ]; then
-    git sparse-checkout reapply >/dev/null 2>&1 || true
-  fi
-  # Replay the manual index bits read-tree dropped (see the snapshot above).
-  if [ "$skip_worktree_paths" != "" ]; then
-    printf '%s\n' "$skip_worktree_paths" | while IFS= read -r p; do
-      [ "$p" = "" ] || git update-index --skip-worktree -- "$p" 2>/dev/null || true
-    done
-  fi
-  if [ "$assume_unchanged_paths" != "" ]; then
-    printf '%s\n' "$assume_unchanged_paths" | while IFS= read -r p; do
-      [ "$p" = "" ] || git update-index --assume-unchanged -- "$p" 2>/dev/null || true
-    done
-  fi
-  git update-index -q --refresh >/dev/null 2>&1 || true
-  # Per-run scratch from the "--prepare" pass; drop it whichever way we leave.
-  rm -f "$predirty_file" 2>/dev/null || true
-}
-trap cleanup EXIT
-# bash does NOT run the EXIT trap when it dies from a SIGINT delivered to the
-# foreground process group (^C at the terminal), which would leave the index
-# rebuilt and the manual bits above stripped. Restore explicitly, then disarm
-# EXIT so cleanup does not run twice.
-trap 'cleanup; trap - EXIT; exit 130' INT
-trap 'cleanup; trap - EXIT; exit 143' TERM
-trap 'cleanup; trap - EXIT; exit 129' HUP
-
-# Reset the index to base without touching the working tree.
-git read-tree "$base"
+# Start the private index at base; the loop below adds one change per commit.
+GIT_INDEX_FILE=$split_index git read-tree "$base"
 
 # Staging the file `a` fails while `a/b` is still in the index: git refuses with
 # "'a' appears as both a file and a directory", and under set -e that aborts the
@@ -184,7 +198,7 @@ git read-tree "$base"
 # diff-tree's order, which emits the addition first.
 nl='
 '
-added_paths=$(printf '%s\n' "$changes" | sed -n "s/^A$tab//p")
+added_paths=$(printf '%s\n' "$changes" | sed -n "s/^[^$tab]* A$tab//p")
 
 # True when one of the added paths is a parent directory of $1.
 under_added_path() {
@@ -213,8 +227,8 @@ while [ "$remaining_changes" != "" ]; do
       remaining_changes=""
       ;;
   esac
-  case $line in
-    "D$tab"*)
+  case ${line%%"$tab"*} in
+    *" D")
       if under_added_path "${line#*"$tab"}"; then
         conflicting="$conflicting$line$nl"
         continue
@@ -248,42 +262,75 @@ is_regular_mode() {
   return 1
 }
 
-# Stage a single path (mode + object id). The mode always comes from the
-# snapshot tree — formatters do not change it. The blob comes from the snapshot
-# too (its staged blob), EXCEPT for a regular file that was clean at hook start,
-# whose worktree blob is taken instead so an in-hook reformat lands in this
-# commit.
+# Stage path $1 in the private index with its staged mode $2 (formatters do not
+# change it) and its staged blob $3, EXCEPT for a regular file that was clean
+# at hook start, whose worktree blob is taken instead so an in-hook reformat
+# lands in this commit.
 stage_one() {
-  # ":(literal)" because ls-tree takes a PATHSPEC: a staged name containing *,
-  # ? or [ would otherwise match sibling entries too and ${_mode%% *} would take
-  # the first one's mode. (rev-parse "<tree>:<path>" below is already literal.)
-  _mode=$(git ls-tree "$staged_tree" -- ":(literal)$1")
-  _mode=${_mode%% *}
-  if [ "$have_predirty" = 1 ] && ! is_predirty "$1" && is_regular_mode "$_mode"; then
+  _oid=$3
+  if [ "$have_predirty" = 1 ] && ! is_predirty "$1" && is_regular_mode "$2"; then
     # hash-object -w applies clean filters (as "git add" would) and writes the
     # blob to the object db so update-index can reference it.
     _oid=$(git hash-object -w -- "$1")
-  else
-    _oid=$(git rev-parse "$staged_tree:$1")
   fi
-  git update-index --add --cacheinfo "$_mode" "$_oid" "$1"
+  GIT_INDEX_FILE=$split_index git update-index --add --cacheinfo "$2" "$_oid" "$1"
+  # A blob other than the staged one has to reach the real index as well;
+  # cleanup stages it if the commit holding it lands.
+  if [ "$_oid" != "$3" ]; then
+    printf '%s %s\t%s\n' "$2" "$_oid" "$1" >>"$folded"
+  fi
 }
 
-printf '%s\n' "$changes" |
-  while IFS="$tab" read -r status path; do
-    case $status in
-      A) message="Add $path" && stage_one "$path" ;;
-      D) message="Delete $path" && git update-index --force-remove -- "$path" ;;
-      *) message="Update $path" && stage_one "$path" ;;
+splitting=1
+seen_head=$start_head
+committed=0
+printf '%s\n' "$changes" >"$split_dir/changes"
+# Read from a file rather than a pipe so the loop runs in this shell, not a
+# subshell: a signal trap then waits for the git command in flight before
+# cleanup removes the private index. From a subshell, a trap could fire while
+# a "git commit" was still reading that index, and git takes a missing index
+# for an empty one — committing a tree with every file deleted.
+while IFS= read -r line; do
+  path=${line#*"$tab"}
+  meta=${line%%"$tab"*}
+  status=${meta##* }
+  mode=${meta#* }
+  oid=${mode#* * }
+  mode=${mode%% *}
+  oid=${oid%% *}
+  case $status in
+    A) message="Add $path" && stage_one "$path" "$mode" "$oid" ;;
+    D) message="Delete $path" && GIT_INDEX_FILE=$split_index git update-index --force-remove -- "$path" ;;
+    *) message="Update $path" && stage_one "$path" "$mode" "$oid" ;;
+  esac
+
+  # Stop if HEAD moved since the split last looked (another commit, checkout
+  # or reset from elsewhere, which nothing locks out while the real index
+  # stays free): this commit would be stacked on top with the private index's
+  # tree, silently reverting whatever moved HEAD. Before the first commit HEAD
+  # must still be where the split started; after that, a child of the HEAD
+  # seen last time, i.e. the commit just made. One rev-parse lists HEAD and
+  # its parents, or fails while the branch is still unborn.
+  heads=$(git rev-parse HEAD 'HEAD^@' 2>/dev/null) || heads=""
+  if [ "$committed" = 0 ]; then
+    found=${heads%%"$nl"*}
+  else
+    found=""
+    case $heads in
+      *"$nl"*) found=${heads#*"$nl"} && found=${found%%"$nl"*} ;;
     esac
+  fi
+  if [ "$found" != "$seen_head" ]; then
+    echo "auto-commit: HEAD moved during the split (another commit, checkout or reset)" >&2
+    exit 1
+  fi
+  seen_head=${heads%%"$nl"*}
 
-    printf '  → %s\n' "$message"
-    LEFTHOOK_AUTO_COMMIT_SPLITTING=1 LEFTHOOK=0 git commit --quiet --no-verify -m "$message"
-  done
-
-# Every path is committed, so the index already matches the snapshot: skip the
-# restore and keep what stat data the per-file commits left.
-split_ok=1
+  printf '  → %s\n' "$message"
+  GIT_INDEX_FILE=$split_index LEFTHOOK_AUTO_COMMIT_SPLITTING=1 LEFTHOOK=0 git commit --quiet --no-verify -m "$message"
+  committed=1
+done <"$split_dir/changes"
+split_done=1
 
 # Cancel the original commit: every change is already committed individually.
 exit 1
