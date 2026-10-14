@@ -165,6 +165,14 @@ order and stop on first failure. `auto-commit` runs afterwards (declared
 linter blocks `auto-commit` entirely. Formatters carry `stage_fixed`, so fixes
 are re-staged before anything is committed.
 
+The checks that read a whole package or module rather than single files
+(`lint-go`, `lint-opentofu`, `security-opentofu`) run on a copy of the staged
+tree, with the staged files as the formatter left them, in a private temporary
+directory. An unstaged edit or an untracked file elsewhere in the package
+therefore cannot fail a commit, nor make one pass that only works together with
+it. Files git ignores (generated code, an untracked `go.work`) are not in that
+copy.
+
 All of this is derived from data in `hooks.nix`, so the order is fixed and
 cannot drift with how the attrset happens to be enumerated.
 
