@@ -1,7 +1,11 @@
 #!/bin/sh
 # tflint analyzes module directories: lint the directories of the staged files
 # instead of the whole repository, so pre-existing debt elsewhere cannot block
-# a commit that never touched it.
+# a commit that never touched it. Lint them as staged, in the copy
+# enter_staged_tree (scripts/staged-tree.sh) checks out, which also makes
+# .tflint.hcl the staged one.
+[ "$#" -gt 0 ] || exit 0
+enter_staged_tree "$@"
 if [ -f .tflint.hcl ]; then
   tflint --init || exit "$?"
 fi
