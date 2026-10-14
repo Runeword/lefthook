@@ -14,6 +14,10 @@
 # contains one would be scanned as two different paths — and if both happen to
 # exist and be clean, the real directory is never scanned and the hook passes.
 # Refuse rather than under-scan.
+#
+# The directories are scanned as staged, in the copy enter_staged_tree
+# (scripts/staged-tree.sh) checks out, not as they sit in the working tree.
+[ "$#" -gt 0 ] || exit 0
 nl='
 '
 for f in "$@"; do
@@ -25,6 +29,7 @@ for f in "$@"; do
   esac
 done
 
+enter_staged_tree "$@"
 for f in "$@"; do
   dirname -- "$f"
 done | sort -u | while IFS= read -r dir; do
