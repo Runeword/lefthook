@@ -20,6 +20,14 @@ let
     [extend]
     useDefault = true
   '';
+
+  # The hooks that check a whole package or module, not the staged files alone,
+  # run on a checkout of the staged tree: scripts/staged-tree.sh defines the
+  # function that makes it, and each script calls it. A function rather than a
+  # wrapper of its own, because its traps and its cd belong to the check's
+  # shell, and wrapping the check would change the `run` strings consumers have
+  # committed.
+  withStagedTree = script: builtins.readFile ./scripts/staged-tree.sh + builtins.readFile script;
 in
 {
   auto-commit = pkgs.writeShellApplication {
@@ -69,9 +77,10 @@ in
     name = "lint-go";
     runtimeInputs = [
       pkgs.coreutils
+      pkgs.git
       pkgs.golangci-lint
     ];
-    text = builtins.readFile ./scripts/lint-go.sh;
+    text = withStagedTree ./scripts/lint-go.sh;
   };
   lint-nix = pkgs.writeShellApplication {
     name = "lint-nix";
@@ -85,16 +94,18 @@ in
     name = "lint-opentofu";
     runtimeInputs = [
       pkgs.coreutils
+      pkgs.git
       pkgs.tflint
     ];
-    text = builtins.readFile ./scripts/lint-opentofu.sh;
+    text = withStagedTree ./scripts/lint-opentofu.sh;
   };
   security-opentofu = pkgs.writeShellApplication {
     name = "security-opentofu";
     runtimeInputs = [
       pkgs.coreutils
+      pkgs.git
       pkgs.trivy
     ];
-    text = builtins.readFile ./scripts/security-opentofu.sh;
+    text = withStagedTree ./scripts/security-opentofu.sh;
   };
 }
