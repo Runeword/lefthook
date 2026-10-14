@@ -70,7 +70,9 @@ hooks.nix  ──►  mk-shell.nix  ──►  lefthook-generated.yml (committed
 - **`wrappers.nix`** — every script with real shell logic, built with
   `writeShellApplication` (strict bash, pinned `runtimeInputs`, shellcheck at
   build time): the `auto-commit`, `lint-*` and `security-opentofu` hooks, plus
-  the non-hook `wire-repo`. Imported by `hooks.nix`, `flake.nix`,
+  the non-hook `wire-repo`. `scripts/staged-tree.sh` is not a wrapper: it is
+  prepended to `lint-go`, `lint-opentofu` and `security-opentofu` (see the
+  invariants below). Imported by `hooks.nix`, `flake.nix`,
   `mk-shell.nix` and `init.nix`. `runtimeInputs` must list *every* command the
   script calls — the ambient `PATH` stays in place, so an omission resolves
   silently from whatever the commit environment happens to have. Note `cmp` is
@@ -162,6 +164,18 @@ lane blocks `auto-commit`.
   commit. Its heredoc rewrite (inserting literal quotes into heredoc bodies) and
   the `${v%% *}` / `${v#* }` iteration idiom in `scripts/init.sh` are unaffected;
   that idiom is still correct POSIX and worth keeping.
+- **Package-level checks read the staged tree, never the working tree.**
+  `lint-go`, `lint-opentofu` and `security-opentofu` analyze a whole package or
+  module, so reading it from the worktree also took in the unstaged edits and
+  untracked files of the files *not* being committed: another session's
+  half-written file failed a commit that did not include it. Each calls
+  `enter_staged_tree` (`scripts/staged-tree.sh`), which checks the staged tree
+  out into a private temp dir and `cd`s into it. The staged files themselves
+  are copied in from the worktree, and that copy must stay: it carries the
+  formatter's fix, which lefthook stages only after the hook, and without it
+  format → lint fails on what gofumpt (`for i, _ := range`, staticcheck S1005)
+  or `tofu fmt` (`type = "string"`) just fixed. Files git ignores are not in
+  the copy.
 - **`auto-commit` cannot see `--amend` or `--fixup`.** The hook environment is
   byte-identical to a normal commit, so both get rewritten into new commits on
   top. There is no fix; `--no-verify` is the documented escape hatch.
