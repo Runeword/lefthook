@@ -5,7 +5,7 @@
 # config, writes it plus a `lefthook.yml` that extends it, and installs the
 # git hooks. Prepended at build time with SELF, NIXPKGS and SYSTEM store paths.
 #
-# Usage: lefthook-init [--lanes a,b] [--no-gitleaks] [--no-auto-commit]
+# Usage: lefthook-init [--lanes a,b] [--no-gitleaks] [--auto-commit]
 #                      [--force] [--adopt-existing-config]
 
 # FEATURE_FLOOR is prepended at build time from feature-floor.nix, the single
@@ -25,7 +25,11 @@ all_lanes=${all_lanes% }
 
 lanes=""
 gitleaks=true
-auto_commit=true
+# Opt-in: every successful split exits 1 (how it cancels the umbrella commit),
+# which editors, GUI clients and `git commit && git push` read as failure, and
+# its per-file commits carry generated messages. Too surprising to switch on
+# for a repository whose owner has not asked for it.
+auto_commit=false
 force=false
 adopt=false
 
@@ -47,6 +51,12 @@ while [ "$#" -gt 0 ]; do
       gitleaks=false
       shift
       ;;
+    --auto-commit)
+      auto_commit=true
+      shift
+      ;;
+    # The default since auto-commit became opt-in; still accepted so scripts
+    # written against the old default keep working.
     --no-auto-commit)
       auto_commit=false
       shift
@@ -66,20 +76,20 @@ Scaffold lefthook into the current git repository.
 Detects the language lanes the repository needs, renders the matching config,
 writes it plus a lefthook.yml that extends it, and installs the git hooks.
 
-Usage: lefthook-init [--lanes a,b] [--no-gitleaks] [--no-auto-commit]
+Usage: lefthook-init [--lanes a,b] [--no-gitleaks] [--auto-commit]
                      [--force] [--adopt-existing-config]
 
   --lanes a,b               skip detection and use these lanes
   --no-gitleaks             omit the repo-wide secret scan
-  --no-auto-commit          omit the per-file commit splitter
+  --auto-commit             add the per-file commit splitter (off by default)
   --force                   overwrite an existing, differing lefthook-generated.yml
   --adopt-existing-config   install hooks even though this repository already
                             ships its own lefthook config (see the warning it
                             prints first — this activates that file's jobs)
 
-gitleaks and auto-commit are ON by default. auto-commit splits each commit into
+gitleaks is ON by default, auto-commit OFF. auto-commit splits each commit into
 one commit per file and cancels the umbrella commit, so `git commit` reports
-failure even when it succeeded; pass --no-auto-commit if that is not wanted.
+failure even when it succeeded; only pass --auto-commit if that is wanted.
 USAGE
       printf '\nLanes: %s\n' "$all_lanes"
       exit 0
@@ -485,13 +495,38 @@ else
   hooks_summary="NOT installed for the generated config (see the warning below)"
 fi
 
+# The config calls every tool by bare name, resolved from PATH when a commit
+# runs, so check them now: otherwise the first commit stops on "command not
+# found" right after a "done." that read as success. The command is the first
+# word of each `run:` after any leading VAR=value assignments.
+missing_tools=$(
+  sed -n "s/^ *run: [\"']\{0,1\}//p" "$rendered" |
+    sed 's/^\([A-Za-z_][A-Za-z0-9_]*=[^ ]* \)*//; s/ .*//' |
+    sort -u |
+    while IFS= read -r tool; do
+      command -v "$tool" >/dev/null 2>&1 || printf '%s ' "$tool"
+    done
+)
+missing_tools=${missing_tools% }
+if [ "$missing_tools" = "" ]; then
+  tools_summary="all on PATH (called by bare name at commit time)"
+else
+  tools_summary="NOT on PATH yet: $missing_tools (see below)"
+fi
+
 cat <<EOF
 lefthook-init: done.
   wrote    $wrote
   hooks    $hooks_summary
-  tools    the config calls them by bare name; they must be on PATH at commit
-           time (a dev shell, or installed globally)
+  tools    $tools_summary
 EOF
+
+if [ "$missing_tools" != "" ]; then
+  echo 'lefthook-init: until those tools are on PATH, every commit stops with "command not found".' >&2
+  echo "lefthook-init: Install exactly the set this config calls, e.g. into your Nix profile:" >&2
+  echo "lefthook-init:   nix profile install --impure --expr '(builtins.getFlake \"github:Runeword/lefthook\").lib.$SYSTEM.toolchainEnv { lanes = [ $lanes_nix ]; gitleaks = $gitleaks; autoCommit = $auto_commit; }'" >&2
+  echo 'lefthook-init: or use a dev shell or home-manager (README: "Installing the tools globally").' >&2
+fi
 
 if [ "$generated_active" = false ]; then
   # Not always lefthook.yml: when the repository ships its main config under one
