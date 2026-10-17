@@ -391,6 +391,12 @@ let
               # `assert_lefthook_installed`; both bite at `run` time, not here.
               mkConfigCheck =
                 src:
+                let
+                  # wire-repo writes the config at the repository's top level,
+                  # but a flake in a subdirectory (nix/flake.nix) gets a `self`
+                  # rooted in that subdirectory; its sourceInfo is the top.
+                  root = if builtins.isAttrs src && src ? sourceInfo then src.sourceInfo else src;
+                in
                 pkgs.runCommand "check-lefthook-config"
                   {
                     nativeBuildInputs = [
@@ -399,8 +405,17 @@ let
                     ];
                   }
                   ''
+                    # A flake sees only the files git tracks: a config the
+                    # shell wrote but nobody added is missing here, and
+                    # regenerating it would not help.
+                    if [ ! -e ${root}/lefthook-generated.yml ]; then
+                      echo "lefthook: lefthook-generated.yml is not in the flake's source;" >&2
+                      echo "lefthook: flakes only see tracked files: git add lefthook-generated.yml lefthook.yml" >&2
+                      exit 1
+                    fi
+
                     # The committed copy must match what the flake renders.
-                    if ! cmp ${src}/lefthook-generated.yml ${configFile}; then
+                    if ! cmp ${root}/lefthook-generated.yml ${configFile}; then
                       echo "lefthook: committed lefthook-generated.yml does not match the flake's render;" >&2
                       echo "lefthook: run 'lefthook-regen' in the dev shell and commit the result" >&2
                       exit 1
@@ -412,6 +427,42 @@ let
                     git init -q
                     cp ${configFile} lefthook.yml
                     lefthook dump >/dev/null
+                    touch "$out"
+                  '';
+              # The hooks themselves, run over every file of `src` the way the
+              # README's CI command runs them: a linter failure or a file a
+              # formatter would change fails the check. In a fresh repository
+              # with everything staged, security-gitleaks scans the whole tree.
+              # Excluded: auto-commit (it would commit) and the jobs that need
+              # the network or the project's own toolchain, which the build
+              # sandbox has neither of (Go modules for lint-go, tflint plugins,
+              # trivy's checks bundle) — run those with the CI command.
+              mkHooksCheck =
+                src:
+                let
+                  # As in mkConfigCheck: the whole repository, not the
+                  # subdirectory a nested flake's `self` is rooted in.
+                  root = if builtins.isAttrs src && src ? sourceInfo then src.sourceInfo else src;
+                in
+                pkgs.runCommand "check-lefthook-hooks"
+                  {
+                    nativeBuildInputs = config.toolchain ++ [ pkgs.git ];
+                    LEFTHOOK_EXCLUDE = "auto-commit,auto-commit-prepare,lint-go,lint-opentofu,security-opentofu";
+                  }
+                  ''
+                    export HOME="$TMPDIR"
+                    cp -r --no-preserve=mode ${root} "$TMPDIR/src"
+                    cd "$TMPDIR/src"
+                    # This shell's own render, whatever is committed (drift is
+                    # mkConfigCheck's job), written before staging so the files
+                    # are part of the tree the hooks see like everything else.
+                    cp ${configFile} lefthook-generated.yml
+                    printf 'extends:\n  - lefthook-generated.yml\n' >lefthook.yml
+                    git init -q
+                    # --force: the source is exactly the tracked files, some of
+                    # which a .gitignore may match.
+                    git add --all --force
+                    lefthook run pre-commit --no-auto-install --no-tty --colors off --fail-on-changes
                     touch "$out"
                   '';
             };
@@ -454,4 +505,14 @@ in
   # install globally instead of using a dev shell (see `lefthook-init`).
   # Same argument shape as `mkShell`.
   toolchain = userConfig: (eval userConfig).toolchain;
+
+  # The same packages as one installable environment, for
+  # `nix profile install` — the command `lefthook-init` prints when the tools
+  # its config calls are not on PATH.
+  toolchainEnv =
+    userConfig:
+    pkgs.buildEnv {
+      name = "lefthook-toolchain";
+      paths = (eval userConfig).toolchain;
+    };
 }
