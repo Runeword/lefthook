@@ -71,12 +71,17 @@ cd "$project_root" || exit 1
 # reported and left alone. The rewrite is `lefthook-regen`, which runs this
 # script without the flag; the `mkConfigCheck` flake check is what makes
 # ignoring the warning fail loudly instead of drifting silently.
+# Files written here, named at the end: a first entry to the dev shell used to
+# create them in silence, and the drift check then failed on a file nobody had
+# been told to commit.
+wrote=""
 if [ -L lefthook-generated.yml ] || ! cmp -s "$rendered" lefthook-generated.yml 2>/dev/null; then
   if [ "$warn_drift" = true ] && { [ -e lefthook-generated.yml ] || [ -L lefthook-generated.yml ]; }; then
     echo "lefthook: warning: lefthook-generated.yml no longer matches what the flake renders;" >&2
     echo "lefthook: warning: run 'lefthook-regen' to rewrite it, then commit the result." >&2
   else
     install -m 644 "$rendered" lefthook-generated.yml
+    wrote=lefthook-generated.yml
   fi
 fi
 
@@ -161,8 +166,15 @@ else
       rm -f lefthook.yml
     fi
     printf 'extends:\n  - lefthook-generated.yml\n' >lefthook.yml
+    wrote="$wrote${wrote:+ and }lefthook.yml"
   fi
 fi
+
+case $wrote in
+  "") ;;
+  *" and "*) echo "lefthook: wrote $wrote; commit them so the hooks travel with the repository" >&2 ;;
+  *) echo "lefthook: wrote $wrote; commit it so the hooks travel with the repository" >&2 ;;
+esac
 
 if [ "$install_hooks" = false ]; then
   exit 0
