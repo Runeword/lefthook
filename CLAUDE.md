@@ -10,9 +10,12 @@ consumer-facing story; this file covers what you need to work *on* the flake.
 
 This repo dogfoods its own `auto-commit` hook, which splits one commit into one
 commit per staged file and then cancels the umbrella commit. So a successful
-commit reports failure and discards your commit message. Check `git log`, not
-the exit code. `LEFTHOOK_EXCLUDE=auto-commit git commit -m "…"` gives a single
-normal commit instead.
+commit reports failure and discards your commit message. Check `git log` (or the
+hook's last line, `auto-commit: N commits made…`), not the exit code; if that
+line says `nothing was committed and everything is still staged` (exit status 3
+in lefthook's summary), nothing landed and `git commit` again retries.
+`LEFTHOOK_EXCLUDE=auto-commit git commit -m "…"` gives a single normal commit
+instead.
 
 Committing also runs this repo's formatters and linters on the staged files and
 **blocks the commit** if they fail (`nixfmt`, `deadnix`, `statix` for Nix;
@@ -24,8 +27,10 @@ it exists so a *consumer's* `#!/bin/bash` script is not rejected outright.
 ## Commands
 
 ```sh
-nix flake check                                    # eval + the config check below
+nix flake check                                    # eval + every check below
 nix build .#checks.x86_64-linux.lefthook-config    # just that check
+nix build -L .#checks.x86_64-linux.behaviour-auto-commit   # tests/auto-commit.sh
+nix build -L .#checks.x86_64-linux.behaviour-staged-tree   # tests/staged-tree.sh
 nix build .#devShells.x86_64-linux.default.lefthookConfig  # render the config
 nix develop                                        # installs hooks; creates lefthook-generated.yml only if MISSING, else warns on drift
 lefthook-regen                                     # (inside the shell) rewrite lefthook-generated.yml after hooks.nix/mk-shell.nix changes
@@ -40,16 +45,27 @@ install -m 644 "$(nix build --no-link --print-out-paths \
 d=$(mktemp -d) && git -C "$d" init -q && (cd "$d" && nix run /home/charles/lefthook#init -- --lanes nix,shell)
 ```
 
-There is no unit-test suite. `checks.lefthook-config` asserts the **committed**
-`lefthook-generated.yml` matches what the flake renders, and that lefthook can
-load it; `checks.lefthook-all-lanes` renders *every* lane (the dev shell only
-covers four) and forces each hook's tools to instantiate, so a nixpkgs bump that
+`checks.lefthook-config` asserts the **committed** `lefthook-generated.yml`
+matches what the flake renders, and that lefthook can load it;
+`checks.lefthook-all-lanes` renders *every* lane (the dev shell only covers
+four) and forces each hook's tools to instantiate, so a nixpkgs bump that
 breaks a tool this repo never builds fails here rather than at a consumer.
 Neither check enforces `min_version` or `assert_lefthook_installed` — `lefthook
 dump` merges without applying them; both bite at `run` time.
 
-Behavioural changes (auto-commit, the scaffolder, hook semantics) are verified
-empirically by driving real `git commit`s in throwaway repos under the
+`checks.behaviour-*` run `tests/<name>.sh` in the build sandbox: real git and
+lefthook, no network, a throwaway HOME, real commits driven through the built
+wrappers. Each test prints `ok`/`UNEXPECTED` against an expectation; `expect
+FAIL` records a known, documented limitation, so a check goes red both when a
+behaviour regresses and when a limitation is lifted without its documentation
+being updated — flip the expectation and fix the prose in the same change.
+`tests/lib.sh` has the helpers, including `instrument`, a git shim that runs a
+snippet after the Nth call of a git subcommand: the deterministic way to stage
+"another terminal acted mid-run". A behavioural change to a wrapper lands with
+a test here.
+
+Anything a sandbox cannot show (the git shim, a real terminal ^C, network
+tools) is still verified by driving real commits in throwaway repos under the
 scratchpad — never in this checkout, which has live hooks.
 
 ## Architecture
@@ -72,11 +88,14 @@ hooks.nix  ──►  mk-shell.nix  ──►  lefthook-generated.yml (committed
   build time): the `auto-commit`, `lint-*` and `security-opentofu` hooks, plus
   the non-hook `wire-repo`. `scripts/staged-tree.sh` is not a wrapper: it is
   prepended to `lint-go`, `lint-opentofu` and `security-opentofu` (see the
-  invariants below). Imported by `hooks.nix`, `flake.nix`,
+  invariants below), which share its runtime inputs (`stagedTreeInputs`: git,
+  flock, findutils, gawk, coreutils). Imported by `hooks.nix`, `flake.nix`,
   `mk-shell.nix` and `init.nix`. `runtimeInputs` must list *every* command the
   script calls — the ambient `PATH` stays in place, so an omission resolves
   silently from whatever the commit environment happens to have. Note `cmp` is
-  in **diffutils**, not coreutils.
+  in **diffutils**, not coreutils. The one deliberate exception is `go` for
+  `lint-go`: golangci-lint loads packages through the project's own toolchain,
+  whose version decides what compiles.
 - **`scripts/wire-repo.sh`** — the shared "point this repo at a rendered
   config" step: writes `lefthook-generated.yml`, seeds `lefthook.yml`, keeps
   `lefthook-local.yml` out of the index, then `lefthook install`. Both the dev
@@ -85,13 +104,24 @@ hooks.nix  ──►  mk-shell.nix  ──►  lefthook-generated.yml (committed
   generated config is never rewritten on entry, only created when missing —
   drift gets a warning naming `lefthook-regen` (the same script in write mode,
   on the shell `PATH`). `lefthook-init` and `lefthook-regen` use write mode.
+  Whatever it writes it names ("wrote … commit it"), in either mode.
 - **`mk-shell.nix`** — an `evalModules` module plus the renderer. Exposes
-  `mkShell` (dev shell) and `toolchain` (the packages, for global installs);
-  both take the same arguments. The shell's passthru carries `lefthookConfig`
-  (the render) and `mkConfigCheck` (the drift check, consumed by this flake's
-  own `checks.lefthook-config` and exportable to consumers).
+  `mkShell` (dev shell), `toolchain` (the packages, for global installs) and
+  `toolchainEnv` (the same packages as one `buildEnv`, for `nix profile
+  install`); all take the same arguments. The shell's passthru carries
+  `lefthookConfig` (the render) and `mkConfigCheck` (the drift check, consumed
+  by this flake's own `checks.lefthook-config` and exportable to consumers),
+  plus `mkHooksCheck` (the enabled hooks over every tracked file of `src` in
+  the build sandbox, minus auto-commit and the network-bound lint-go,
+  lint-opentofu and security-opentofu; dogfooded as `checks.lefthook-hooks`). Both
+  checks read the repository from `src.sourceInfo` when `src` has one, because a
+  flake in a subdirectory gets a `self` rooted there while wire-repo writes at
+  the repository's top level.
 - **`init.nix` / `scripts/init.sh`** — the `lefthook-init` scaffolder, for
-  repos with no dev shell.
+  repos with no dev shell. gitleaks is on by default, auto-commit is opt-in
+  (`--auto-commit`; `--no-auto-commit` is still accepted). It ends by checking
+  that every command the config's `run:` lines call is on `PATH`, and prints
+  the `toolchainEnv` install command for the ones that are not.
 
 Ordering is data, never attrset order: lanes run in parallel under a `main`
 job, jobs inside a lane are piped by `order` (format → lint → security),
@@ -169,48 +199,130 @@ lane blocks `auto-commit`.
   module, so reading it from the worktree also took in the unstaged edits and
   untracked files of the files *not* being committed: another session's
   half-written file failed a commit that did not include it. Each calls
-  `enter_staged_tree` (`scripts/staged-tree.sh`), which checks the staged tree
-  out into a private temp dir and `cd`s into it. The staged files themselves
-  are copied in from the worktree, and that copy must stay: it carries the
-  formatter's fix, which lefthook stages only after the hook, and without it
-  format → lint fails on what gofumpt (`for i, _ := range`, staticcheck S1005)
-  or `tofu fmt` (`type = "string"`) just fixed. Files git ignores are not in
-  the copy.
+  `enter_staged_tree` (`scripts/staged-tree.sh`), which builds a copy of the
+  staged tree and `cd`s into it. What holds it together:
+  - **One stable directory per repository and hook, never a fresh random one,
+    never `/tmp`.** The path is
+    `${XDG_CACHE_HOME:-$HOME/.cache}/lefthook/staged/<hash of the common git dir>/<hook>/`,
+    every level 0700, owned by the user, and refused otherwise.
+    - golangci-lint caches findings by content but records absolute paths.
+      From a new path on each run, a retried commit replayed findings into the
+      deleted copy: `//nolint` and generated-file exclusions stopped applying,
+      the commit stayed blocked, and the poisoned entries reached the user's
+      shared cache (editor runs).
+    - The go build cache also missed on every run.
+    - `/tmp` is shared, and go and golangci-lint read go.work and .golangci.*
+      from every parent directory.
+  - **A flock serializes it.** The lock is `<hook>/lock`, taken with the
+    portable `flock` package. The tree is rebuilt on each run and removed on
+    exit.
+    - lefthook SIGKILLs a job's process group on ^C, so no trap runs then. The
+      next run of that hook reclaims the copy, and every run deletes other
+      copies idle for more than 60 minutes whose lock `flock -n` can take.
+    - Never replace the lock with mkdir: a SIGKILL would leave it held forever.
+  - **Worktree form where the worktree is clean, the staged blob where it is
+    not.** One cp batch and one checkout-index, never a process per file.
+    - Clean files are copied from the worktree: git-crypt plaintext, smudged
+      LFS, the user's line endings.
+    - Changed, missing, skip-worktree and assume-unchanged files (every file
+      under core.ignoreStat) are checked out with `--attr-source=<staged tree>`.
+    - The hook's own FILEs always come from the worktree when they are regular
+      files on both sides. They carry the formatter's fix, which lefthook
+      stages only after the hook; without it, format → lint fails on what
+      gofumpt (`for i, _ := range`) or `tofu fmt` (`type = "string"`) just
+      fixed.
+    - Gitlinks are filled from the submodule's own objects at the recorded
+      commit.
+  - **The real index is never written.** The snapshot comes from a copy of the
+    index, because write-tree takes index.lock. The dirty set comes from
+    `GIT_OPTIONAL_LOCKS=0 git diff`.
+  - **The appended script gets paths, not git env.** GIT_DIR, GIT_WORK_TREE and
+    GIT_INDEX_FILE are unset; it receives `staged_worktree`, `staged_prefix`,
+    `staged_copy`, `staged_index`, `staged_git_dir`, `staged_cache` and
+    `staged_scratch` instead. Each lint script carries a file-wide
+    `shellcheck disable=SC2154` for them, because this repo's own hook runs
+    shellcheck on each file alone.
+  - **lint-go resolves by location as the worktree would**, then points into
+    the copy.
+    - It resolves the golangci-lint config, GOWORK, and relative replace/use
+      paths that leave the repository.
+    - It carries in the git-ignored files that `go list -deps -test` reports.
+      It skips `go list` when nothing ignored could be a build input.
+    - golangci-lint gets a hook-private GOLANGCI_LINT_CACHE, so its absolute
+      paths never reach the user's cache.
+    - GIT_DIR, GIT_WORK_TREE and GIT_INDEX_FILE name the repo, the copy and the
+      copy's index, so new-from-rev works.
+    - `go` is the one command it deliberately takes from the ambient PATH: the
+      project's toolchain decides what compiles.
+  - **OpenTofu.**
+    - `.terraform/modules` is *copied* in: trivy does not follow a symlinked
+      directory.
+    - A relative tflint `plugin_dir` is rewritten to the worktree path, because
+      tflint ranks it above TFLINT_PLUGIN_DIR.
+    - security-opentofu skips other root modules file by file
+      (`--skip-files <dir>/*.tf`). Never use `--skip-dirs`: it hid the called
+      modules too, so nothing passed into a module was checked.
+    - security-opentofu fails on "Failed to load module".
 - **`auto-commit` cannot see `--amend` or `--fixup`.** The hook environment is
   byte-identical to a normal commit, so both get rewritten into new commits on
   top. There is no fix; `--no-verify` is the documented escape hatch.
-- **`auto-commit` never rewrites the real index mid-split.** The per-file
-  commits are built in a private `GIT_INDEX_FILE` (`.git/lefthook-split.*/`).
-  Anything can hold `.git/index.lock` at any moment (a `git status` in another
-  terminal, magit, a prompt), and the old in-place split then failed partway;
-  its restore hit the same lock and wiped the staging, with exit 1 like a
-  success. The snapshot is taken from a *copy* of the real index (even
-  `write-tree` takes the lock). The only write to the real index is at the end:
-  `--index-info` for the blobs the fold took from the worktree, retried while
-  the lock is busy, and only where HEAD holds them. Skip-worktree and
-  assume-unchanged bits and the stat cache survive because nothing touches
-  them. Do not reintroduce a `read-tree` or per-path `update-index` on the real
-  index. Two consequences hold the design together:
-  - With the real index free, nothing locks out a concurrent commit, checkout
-    or reset. Before each commit the loop checks that HEAD is still where it
-    left it, or the commit would revert whatever moved HEAD. The check is one
-    `rev-parse HEAD 'HEAD^@'`, and the raw `diff-tree` output carries
-    mode+blob, so the split spawns no more processes than before.
-  - The loop must run in the main shell (reading a file, not a pipe). A pipeline
-    subshell let the INT trap delete the private index while a `git commit` was
-    still reading it, and git took the missing index for an empty one: it
-    committed a tree with every file deleted.
+- **`auto-commit` publishes all or nothing and never rewrites the real index
+  mid-split.** Each per-file commit is built with `git commit-tree` from a
+  private `GIT_INDEX_FILE` (`.git/lefthook-split.*/`); the branch moves once, at
+  the end, with a compare-and-swap `git update-ref <ref> <new> <old>`, after
+  re-checking that `HEAD` still points to that branch. Anything can hold
+  `.git/index.lock` at any moment (a `git status` in another terminal, magit, a
+  prompt); the old in-place split then failed partway and its restore wiped
+  the staging. The snapshot is taken from a *copy* of the real index (even
+  `write-tree` takes the lock). Do not reintroduce `git commit`, a `read-tree`
+  or a per-path `update-index` on the real index. What holds the design
+  together:
+  - Nothing locks out a concurrent commit, checkout or reset, so the
+    compare-and-swap is the guard: if the branch moved, or `HEAD` now points
+    elsewhere, the split publishes nothing and exits 3. 1 means "split and
+    committed", so a failure that would exit 1 before publishing (commit-tree
+    does, when the signer refuses) exits 3 too.
+  - The only write to the real index is the reconcile after publishing: one
+    `update-index --index-info` bringing each path the split handled up to the
+    entry `HEAD` now holds, but only where `HEAD` really holds it and the real
+    entry is still the base or the snapshot entry (a folded formatter fix, or
+    another process's `git reset`). Any other entry is a newer staging and is
+    kept. A rewritten entry loses its stat data (git re-reads that one file)
+    and any assume-unchanged bit; untouched entries keep both.
+  - commit-tree runs no hooks and ignores `commit.gpgSign`: the split passes
+    `-S` itself, and `prepare-commit-msg`/`post-commit` no longer run per file.
+    It skips a path a formatter returned to its base content (no empty commit),
+    and runs `git maintenance run --auto --detach` once after publishing, since
+    the cancelled umbrella commit never does.
+  - Fold candidates' worktree blobs are hashed in one `hash-object -w
+    --stdin-paths` before the first commit; a path that is no longer a regular
+    file in the worktree keeps its staged blob.
+  - The loop must run in the main shell (reading a file, not a pipe): from a
+    pipeline subshell a trap can delete the private index while git still
+    reads it, and git takes a missing index for an empty one.
 
-  Stopping partway (an error, ^C, TERM, even SIGKILL) therefore leaves exactly
-  the uncommitted files staged. bash does not run an `EXIT` trap when it dies
-  of a group `SIGINT`, so `INT`/`TERM`/`HUP` are trapped explicitly. lefthook
-  SIGKILLs a job on ^C, so no trap runs there, which is why each run sweeps
-  split dirs left idle for an hour.
+  Stopping before the publish (an error, ^C, TERM, SIGKILL, a refused
+  signature) therefore leaves the repository exactly as it was. bash does not
+  run an `EXIT` trap when it dies of a group `SIGINT`, so `INT`/`TERM`/`HUP` are
+  trapped explicitly; lefthook SIGKILLs a job on ^C, so no trap runs there,
+  which is why every run (the `--prepare` pass included) sweeps split dirs left
+  idle for an hour. A SIGKILL in the instant between publishing and the
+  reconcile leaves folded paths staged with their pre-format blobs (lefthook >=
+  2.1.7 re-stages them itself when it survives).
 - **`auto-commit` must pass through** when git is not operating on the real
   index (`GIT_INDEX_FILE` ending in `.lock`, i.e. `git commit -a` and pathspec
-  commits) or when a merge/squash-merge/cherry-pick/revert/rebase is in
-  progress. Removing either guard silently corrupts history; both are covered in
-  `scripts/auto-commit.sh`.
+  commits), when a merge/squash-merge/cherry-pick/revert/rebase is in
+  progress, and when a `commit-msg` or `prepare-commit-msg` hook is installed
+  (found through `git rev-parse --git-path`, so `core.hooksPath` counts), whose
+  checks the generated messages would bypass. Removing either of the first two
+  guards silently corrupts history; all three are covered in
+  `tests/auto-commit.sh`.
+- **`auto-commit --prepare` refuses a staged path starting with `:`.** lefthook
+  hands staged file names to `git add`/`git checkout` as pathspecs, where `:`
+  starts pathspec magic, so git would act on some other file (an ignored one
+  included: `stage_fixed` adds with `--force`). The real fix is upstream
+  (literal pathspecs); until then this guard exists only where auto-commit is
+  enabled.
 
 ## Nix gotchas seen in this repo
 
