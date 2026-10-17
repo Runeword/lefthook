@@ -20,6 +20,44 @@
             pkgs = nixpkgs.legacyPackages.${system};
           }
         );
+
+      mkBehaviourCheck =
+        pkgs: name: extraInputs:
+        let
+          wrappers = import ./wrappers.nix { inherit pkgs; };
+          bin = w: "${wrappers.${w}}/bin/${w}";
+        in
+        pkgs.runCommand "check-behaviour-${name}"
+          {
+            nativeBuildInputs = [
+              pkgs.coreutils
+              pkgs.diffutils
+              pkgs.findutils
+              pkgs.gawk
+              pkgs.git
+              pkgs.gnugrep
+              pkgs.gnused
+              pkgs.lefthook
+              pkgs.procps
+            ]
+            ++ extraInputs;
+            AUTO_COMMIT = bin "auto-commit";
+            LINT_GO = bin "lint-go";
+            LINT_OPENTOFU = bin "lint-opentofu";
+            SECURITY_OPENTOFU = bin "security-opentofu";
+            REAL_GIT = "${pkgs.git}/bin/git";
+            TEST_LIB = ./tests/lib.sh;
+          }
+          ''
+            export HOME=$TMPDIR/home
+            mkdir -p "$HOME"
+            git config --global user.name test
+            git config --global user.email test@example.com
+            git config --global init.defaultBranch main
+            git config --global advice.detachedHead false
+            bash ${./tests + "/${name}.sh"}
+            touch "$out"
+          '';
     in
     {
       lib = forAllSystems (
@@ -151,6 +189,22 @@
           # `mkConfigCheck` every consumer gets from `mkShell`'s passthru, so
           # the exported check is itself under test here.
           lefthook-config = self.devShells.${system}.default.mkConfigCheck self;
+
+          # This repository's own hooks over its own tree, through the same
+          # exported `mkHooksCheck` consumers use.
+          lefthook-hooks = self.devShells.${system}.default.mkHooksCheck self;
+
+          # Behavioural checks: tests/<name>.sh drives the wrappers through
+          # real commits in the build sandbox (real git and lefthook, no
+          # network, a throwaway HOME). A known limitation is recorded as an
+          # expected failure, so these go red on a regression AND when a
+          # limitation is lifted without its documentation being updated.
+          behaviour-auto-commit = mkBehaviourCheck pkgs "auto-commit" [ ];
+          behaviour-staged-tree = mkBehaviourCheck pkgs "staged-tree" [
+            # golangci-lint loads packages through the go command; the wrapper
+            # takes it from the project's own toolchain, so supply one here.
+            pkgs.go
+          ];
         }
       );
     };
