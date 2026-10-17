@@ -22,23 +22,36 @@ let
   '';
 
   # The hooks that check a whole package or module, not the staged files alone,
-  # run on a checkout of the staged tree: scripts/staged-tree.sh defines the
-  # function that makes it, and each script calls it. A function rather than a
-  # wrapper of its own, because its traps and its cd belong to the check's
-  # shell, and wrapping the check would change the `run` strings consumers have
-  # committed.
+  # run on a copy of the staged tree: scripts/staged-tree.sh defines the
+  # function that builds it, and each script calls it. A function rather than
+  # a wrapper of its own, because its traps, its lock and its cd belong to the
+  # check's shell, and wrapping the check would change the `run` strings
+  # consumers have committed.
   withStagedTree = script: builtins.readFile ./scripts/staged-tree.sh + builtins.readFile script;
+  # What staged-tree.sh itself calls: git, flock (the portable one, same CLI as
+  # util-linux's, so it also builds on darwin) for the per-repository lock,
+  # find/xargs for the sweep and the batched copy, awk to sort entries between
+  # working tree and index, and coreutils.
+  stagedTreeInputs = [
+    pkgs.coreutils
+    pkgs.findutils
+    pkgs.flock
+    pkgs.gawk
+    pkgs.git
+  ];
 in
 {
   auto-commit = pkgs.writeShellApplication {
     name = "auto-commit";
-    # Not just git: sed for the deletions-before-additions reorder, coreutils'
-    # mktemp/cp/rm/sleep for the private index and its lock retry, find to sweep
-    # the private indexes of killed splits, and cat for the "--prepare" predirty
-    # snapshot.
+    # Not just git: awk to plan the commits (the deletions-before-additions
+    # reorder, which paths fold in a formatter's fix) and to reconcile the index
+    # after publishing, sed for the "--prepare" pathspec guard and messages,
+    # coreutils' mktemp/cp/rm/sleep for the private index and its lock retry,
+    # and find to sweep the private indexes of killed splits.
     runtimeInputs = [
       pkgs.coreutils
       pkgs.findutils
+      pkgs.gawk
       pkgs.git
       pkgs.gnused
     ];
@@ -73,12 +86,14 @@ in
     ''
     + builtins.readFile ./scripts/wire-repo.sh;
   };
+  # `go` is deliberately absent: golangci-lint loads packages through the
+  # project's own Go toolchain from PATH, whose version decides what compiles.
+  # jq reads `go mod edit -json` and `go work edit -json`.
   lint-go = pkgs.writeShellApplication {
     name = "lint-go";
-    runtimeInputs = [
-      pkgs.coreutils
-      pkgs.git
+    runtimeInputs = stagedTreeInputs ++ [
       pkgs.golangci-lint
+      pkgs.jq
     ];
     text = withStagedTree ./scripts/lint-go.sh;
   };
@@ -92,18 +107,14 @@ in
   };
   lint-opentofu = pkgs.writeShellApplication {
     name = "lint-opentofu";
-    runtimeInputs = [
-      pkgs.coreutils
-      pkgs.git
-      pkgs.tflint
-    ];
+    runtimeInputs = stagedTreeInputs ++ [ pkgs.tflint ];
     text = withStagedTree ./scripts/lint-opentofu.sh;
   };
   security-opentofu = pkgs.writeShellApplication {
     name = "security-opentofu";
-    runtimeInputs = [
-      pkgs.coreutils
-      pkgs.git
+    runtimeInputs = stagedTreeInputs ++ [
+      pkgs.gnugrep
+      pkgs.gnused
       pkgs.trivy
     ];
     text = withStagedTree ./scripts/security-opentofu.sh;
