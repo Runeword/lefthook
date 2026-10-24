@@ -22,6 +22,13 @@
 #     blocked, and every later edit near an old one is blocked forever. Only
 #     added lines are scanned, which is what `gitleaks git --staged` did.
 
+# `git --literal-pathspecs commit`, magit's default, exports
+# GIT_LITERAL_PATHSPECS to the hook, and git then refuses the `:(literal)`
+# pathspecs below: the report named no file. GIT_GLOB_PATHSPECS,
+# GIT_NOGLOB_PATHSPECS and GIT_ICASE_PATHSPECS would change what they match.
+unset GIT_LITERAL_PATHSPECS GIT_GLOB_PATHSPECS GIT_NOGLOB_PATHSPECS \
+  GIT_ICASE_PATHSPECS
+
 # An empty result from a failed diff is indistinguishable from "nothing staged"
 # by the time it reaches gitleaks, so refuse to report a clean scan instead.
 if ! diff=$(git diff --cached --text --diff-filter=ACMR); then
@@ -43,11 +50,13 @@ fi
 # `gitleaks stdin` has no path context, so the report above names no file — on a
 # large commit that leaves the developer hunting. Re-scan per staged path just
 # to say where. Diagnostic only: the exit status was already decided above.
+# Each path is diffed literally: as a pathspec, g*.txt took in gx.txt's lines
+# and :x.txt meant x.txt, and the report named files that hold nothing.
 echo "security-gitleaks: secret(s) found in the staged changes to:" >&2
 git -c core.quotePath=false diff --cached --name-only --diff-filter=ACMR |
   while IFS= read -r path; do
     [ "$path" != "" ] || continue
-    if ! git diff --cached --text -- "$path" |
+    if ! git diff --cached --text -- ":(literal)$path" |
       sed -n '/^+++/!{/^+/p;}' |
       gitleaks stdin --no-banner --log-level=error --config="$GITLEAKS_CONFIG_FILE" >/dev/null 2>&1; then
       printf '  %s\n' "$path" >&2
