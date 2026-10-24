@@ -311,8 +311,10 @@ if ! version_ge "$runner_version" "$FEATURE_FLOOR"; then
   exit 1
 fi
 
-# Turn "nix,shell" into the Nix list literal '"nix" "shell"'.
-lanes_nix=$(printf '%s' "$lanes" | tr ',' '\n' | sed 's/^/"/; s/$/"/' | tr '\n' ' ')
+# nix_strings SEP LIST: the items of LIST, separated by SEP, as the elements of
+# a Nix list literal: "nix,shell" with SEP , gives '"nix" "shell" '.
+nix_strings() { printf '%s' "$2" | tr "$1" '\n' | sed 's/^/"/; s/$/"/' | tr '\n' ' '; }
+lanes_nix=$(nix_strings , "$lanes")
 
 echo "lefthook-init: lanes: ${lanes:-(none)}  gitleaks: $gitleaks  auto-commit: $auto_commit"
 echo "lefthook-init: runner: $runner ($runner_version)"
@@ -499,19 +501,36 @@ fi
 # runs, so check them now: otherwise the first commit stops on "command not
 # found" right after a "done." that read as success. The command is the first
 # word of each `run:` after any leading VAR=value assignments.
-missing_tools=$(
+run_tools=$(
   sed -n "s/^ *run: [\"']\{0,1\}//p" "$rendered" |
     sed 's/^\([A-Za-z_][A-Za-z0-9_]*=[^ ]* \)*//; s/ .*//' |
-    sort -u |
+    sort -u
+)
+missing_tools=$(
+  printf '%s\n' "$run_tools" |
     while IFS= read -r tool; do
+      [ "$tool" != "" ] || continue
       command -v "$tool" >/dev/null 2>&1 || printf '%s ' "$tool"
     done
 )
 missing_tools=${missing_tools% }
-if [ "$missing_tools" = "" ]; then
+# lint-go lints through the project's own go, taken from PATH: no run: line
+# names it, and nothing here installs it (wrappers.nix).
+missing_names=$missing_tools
+if printf '%s\n' "$run_tools" | grep -x lint-go >/dev/null &&
+  ! command -v go >/dev/null 2>&1; then
+  missing_names="go${missing_names:+ }$missing_names"
+fi
+# What the install command below names: the missing tools, and lefthook itself
+# when the runner above was this flake's fallback.
+install_names=$missing_tools
+if ! command -v lefthook >/dev/null 2>&1; then
+  install_names="$install_names${install_names:+ }lefthook"
+fi
+if [ "$missing_names" = "" ]; then
   tools_summary="all on PATH (called by bare name at commit time)"
 else
-  tools_summary="NOT on PATH yet: $missing_tools (see below)"
+  tools_summary="NOT on PATH yet: $missing_names (see below)"
 fi
 
 cat <<EOF
@@ -521,12 +540,24 @@ lefthook-init: done.
   tools    $tools_summary
 EOF
 
-if [ "$missing_tools" != "" ]; then
+if [ "$missing_names" != "" ]; then
   echo 'lefthook-init: until those tools are on PATH, every commit stops with "command not found".' >&2
-  echo "lefthook-init: Install exactly the set this config calls, e.g. into your Nix profile:" >&2
-  echo "lefthook-init:   nix profile install --impure --expr '(builtins.getFlake \"github:Runeword/lefthook\").lib.$SYSTEM.toolchainEnv { lanes = [ $lanes_nix ]; gitleaks = $gitleaks; autoCommit = $auto_commit; }'" >&2
+fi
+if [ "$install_names" != "" ]; then
+  # Only what is missing: a package the profile already has (lefthook, most
+  # likely, since this script just ran one) collides with its copy and fails
+  # the whole install. And from the flake that rendered this config, not from
+  # whatever github: resolves to today, which may lack a tool it calls.
+  only_nix=$(nix_strings ' ' "$install_names")
+  echo "lefthook-init: Install what is missing, e.g. into your Nix profile, from the flake that rendered this config:" >&2
+  echo "lefthook-init:   nix profile install --impure --expr '(builtins.getFlake \"path:$SELF\").lib.$SYSTEM.toolchainEnv { lanes = [ $lanes_nix ]; gitleaks = $gitleaks; autoCommit = $auto_commit; only = [ $only_nix ]; }'" >&2
   echo 'lefthook-init: or use a dev shell or home-manager (README: "Installing the tools globally").' >&2
 fi
+case " $missing_names " in
+  *" go "*)
+    echo "lefthook-init: go comes from your project, not from here: lint-go lints with the project's own Go toolchain, so put the go that builds it on PATH." >&2
+    ;;
+esac
 
 if [ "$generated_active" = false ]; then
   # Not always lefthook.yml: when the repository ships its main config under one
