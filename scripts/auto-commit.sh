@@ -8,8 +8,11 @@
 # finalize job, leaving the index alone still holding the pre-format blob. A
 # file that ALREADY had unstaged changes is committed from its STAGED blob, so
 # partial staging ("git add -p") is preserved: unstaged hunks stay uncommitted.
-# The two are told apart by the "--prepare" pass below, which must run as the
-# FIRST pre-commit job, before any formatter touches the worktree.
+# So is a file git does not compare with the index (marked assume-unchanged or
+# skip-worktree, or any file under core.ignoreStat), whose working-tree copy
+# may hold a local-only edit nobody staged, and one below a symlinked directory.
+# The two are told apart by the "--prepare" pass below, which must run before
+# any formatter touches the worktree.
 #
 # The commits are built off to the side and published all at once. Each is
 # made with "git commit-tree" from a PRIVATE index file, never the real one:
@@ -46,25 +49,33 @@ predirty_file="$git_dir/lefthook-ac-predirty"
 # just fails before publishing, with nothing committed.
 find "$git_dir" -maxdepth 1 -type d -name 'lefthook-split.*' -mmin +60 -exec rm -rf -- {} + 2>/dev/null || true
 
-# "--prepare" runs as the FIRST pre-commit job, before any formatter. It records
-# the staged paths that ALREADY carry unstaged changes, so the finalize pass can
-# tell a formatter's in-hook edit (fold into the commit) from a deliberate
-# partial stage (leave the excluded hunks out). quotePath=false so these match
-# the diff-tree paths the finalize pass compares them against. The redirect
-# always creates the file, so a later MISSING file means this pass never ran.
+# "--prepare" runs ahead of every formatter, as the first job after the
+# guards, which change neither the index nor a file. It records the staged
+# paths whose working-tree file may ALREADY differ from the staged one, so the
+# finalize pass can tell a formatter's in-hook edit (fold into the commit) from
+# a deliberate partial stage (leave the excluded hunks out). quotePath=false so
+# these match the diff-tree paths the finalize pass compares them against. A
+# later MISSING file means this pass never ran, or could not make its list.
 if [ "${1:-}" = "--prepare" ]; then
-  # lefthook hands staged file names to git as pathspecs (re-staging a
-  # formatter's fix, setting unstaged hunks aside), and a name starting with
-  # ':' reads there as pathspec magic: git would act on some other file, an
-  # ignored one included. Refuse before any of that runs.
-  colon_paths=$(git -c core.quotePath=false diff --cached --name-only --diff-filter=ACMRT 2>/dev/null |
-    sed -n '/^:/p') || colon_paths=""
-  if [ -n "$colon_paths" ]; then
-    echo "auto-commit: these staged files start with ':', which git reads as pathspec magic when lefthook hands it their names; rename them (or commit with --no-verify):" >&2
-    printf '%s\n' "$colon_paths" | sed 's/^/  /' >&2
-    exit 1
-  fi
-  git -c core.quotePath=false diff --name-only >"$predirty_file" 2>/dev/null || true
+  # Staged names lefthook would hand to git as patterns that reach other files
+  # are refused by pathspec-guard (scripts/pathspec-guard.sh), the render's
+  # first job wherever a formatter stages its fix, which also keeps a copy of
+  # lefthook's backup of the unstaged changes. Configs rendered with this pass
+  # (from 2026-08-15) but before that job existed run only this pass, so it
+  # calls the guard too.
+  pathspec-guard || exit 1
+  # Those with unstaged changes, and those git never compares, which "git diff"
+  # cannot show: marked assume-unchanged or skip-worktree (lowercase or S in
+  # "ls-files -v"), usually because the working-tree copy holds a local-only
+  # edit. Under core.ignoreStat git compares none of them, so every staged path
+  # is listed. A list that cannot be made is no list at all: the finalize pass
+  # then keeps every staged blob, rather than fold what a partial one left out.
+  if [ "$(git config --type=bool --get core.ignoreStat || true)" = true ]; then
+    git -c core.quotePath=false diff --cached --name-only --no-renames
+  else
+    GIT_OPTIONAL_LOCKS=0 git -c core.quotePath=false diff --name-only --no-renames &&
+      git -c core.quotePath=false ls-files -v | LC_ALL=C sed -n 's/^[a-zS] //p'
+  fi >"$predirty_file" 2>/dev/null || rm -f -- "$predirty_file"
   exit 0
 fi
 
@@ -92,13 +103,31 @@ if git diff --cached --quiet; then
   exit 0
 fi
 
+# lefthook_stub HOOK PATH: whether PATH is the script lefthook installs for HOOK
+# (told by its last line, in both forms lefthook has written) while lefthook's
+# merged config, as `lefthook dump` prints it, has no HOOK section, so that it
+# runs nothing. Anything else counts as a message check, a dump that fails
+# included.
+lefthook_stub() {
+  LC_ALL=C awk -v h="$1" '
+    { last = $0 }
+    END { exit !(last == "call_lefthook run \"" h "\" \"$@\"" || last == "call_lefthook \"run " h " $@\"") }' "$2" 2>/dev/null ||
+    return 1
+  _dump=$(lefthook dump 2>/dev/null) || return 1
+  printf '%s\n' "$_dump" | LC_ALL=C awk -v h="$1" 'index($0, h ":") == 1 { found = 1 } END { exit found }'
+}
+
 # A commit-msg or prepare-commit-msg hook holds commit messages to some rule (a
 # ticket id, a convention, a sign-off). The per-file commits carry generated
 # messages it would never see, so leave the commit whole and let git run the
-# hook on it. --git-path honours core.hooksPath.
+# hook on it. --git-path honours core.hooksPath. lefthook's own script for a
+# hook its config leaves out runs nothing, though, and lefthook 1.13.0 to
+# 2.0.15 install one for prepare-commit-msg on every `lefthook install` (to keep
+# the hooks in sync; later versions when the config has no hooks at all), where
+# it stays: that one is no reason to keep the commit whole.
 for hook in prepare-commit-msg commit-msg; do
   hook_path=$(git rev-parse --git-path "hooks/$hook")
-  if [ -f "$hook_path" ] && [ -x "$hook_path" ]; then
+  if [ -f "$hook_path" ] && [ -x "$hook_path" ] && ! lefthook_stub "$hook" "$hook_path"; then
     echo "auto-commit: a $hook hook is installed, so this commit is not split: it stays one commit, for that hook to check"
     exit 0
   fi
@@ -129,6 +158,11 @@ fi
 
 tab=$(printf '\t')
 
+# The real index, absolute (git hands the hook a path relative to the top), and
+# the lock file git creates before it writes that index.
+real_index=$(git rev-parse --path-format=absolute --git-path index)
+index_lock=$real_index.lock
+
 # The private index, in a directory of its own: unique per run, so two splits
 # at once never share one, and absolute so it still resolves from a hook that
 # changes directory.
@@ -145,25 +179,79 @@ entries=$split_dir/entries
 # HEAD really holds that entry, though (after a checkout or reset elsewhere the
 # index describes some other commit), and only where the real index still has
 # the entry the split started from or the one it snapshotted: anything else is
-# a newer staging, and stays. One read of each listing and one write, the only
-# write to the real index; it waits out whoever holds the lock.
+# a newer staging, and stays. That write is the only one to the real index.
+#
+# It is made under index.lock, held from the read to the write: read without
+# it, a "git add" or a commit that landed in between was overwritten with what
+# the read saw, unstaging the add or setting up the next commit to revert the
+# commit. git takes that lock by creating the file exclusively, and so does
+# this (noclobber, which bash implements with O_EXCL); git then refuses to write
+# the index until the lock is gone, and so waits or fails instead. The new index
+# is written into the lock file and renamed over the index, as git does. A first
+# look without the lock comes before: usually nothing needs writing, and writing
+# nothing needs no lock.
 reconcile() {
   reconciled=1
   [ -s "$entries" ] || return 0
-  git -c core.quotePath=false ls-files -s >"$split_dir/real" 2>/dev/null || return 0
+  if reconcile_plan "$real_index" "$split_dir/stage-unlocked" 2>/dev/null &&
+    [ ! -s "$split_dir/stage-unlocked" ]; then
+    return 0
+  fi
+  _tries=0
+  until (set -C && : >"$index_lock") 2>/dev/null; do
+    _tries=$((_tries + 1))
+    if [ "$_tries" -ge 50 ]; then
+      echo "auto-commit: another git process held $index_lock for 5 s" >&2
+      reconcile_failed "$split_dir/stage-unlocked"
+      return 0
+    fi
+    sleep 0.1
+  done
+  index_locked=1
+  # The copy keeps the index's mtime, against which git tells a racily clean
+  # entry, so git still re-checks such an entry rather than trust its stat data.
+  if ! cp --preserve=timestamps -- "$real_index" "$index_lock" ||
+    ! reconcile_plan "$index_lock" "$split_dir/stage"; then
+    rm -f -- "$index_lock"
+    reconcile_failed "$split_dir/stage-unlocked"
+  elif [ ! -s "$split_dir/stage" ]; then
+    rm -f -- "$index_lock"
+  elif ! { GIT_INDEX_FILE=$index_lock git update-index --index-info <"$split_dir/stage" &&
+    mv -f -- "$index_lock" "$real_index"; }; then
+    rm -f -- "$index_lock"
+    reconcile_failed "$split_dir/stage"
+  fi
+  index_locked=0
+}
+
+# reconcile_failed PLAN: say which paths PLAN would have brought up to date.
+reconcile_failed() {
+  echo "auto-commit: committed, but the index could not be brought up to date for these (git add them):" >&2
+  sed "s/^[^$tab]*$tab/  /" "$1" >&2 2>/dev/null || true
+}
+
+# reconcile_plan INDEX OUT: into OUT, the --index-info lines that bring each
+# path the split handled in INDEX up to what HEAD records, where reconcile may.
+reconcile_plan() {
+  : >"$2"
+  GIT_INDEX_FILE=$1 git -c core.quotePath=false ls-files -s >"$split_dir/real" || return
   git -c core.quotePath=false ls-tree -r --full-tree HEAD >"$split_dir/head" 2>/dev/null ||
     : >"$split_dir/head"
   # Entries are "mode oid", or "-" for absent; the zero oid (a removal for
   # --index-info) takes its length from the base oid, so SHA-256 works too.
+  # The listings hold every path: only those the split handled are parsed.
   LC_ALL=C awk '
     function ent(mode, oid) { return (mode + 0 == 0) ? "-" : (mode " " oid) }
-    { t = index($0, "\t"); p = substr($0, t + 1); split(substr($0, 1, t - 1), f, " ") }
+    { t = index($0, "\t"); p = substr($0, t + 1) }
     FILENAME == ARGV[1] {
+      split(substr($0, 1, t - 1), f, " ")
       order[++n] = p
       B[p] = ent(f[1], f[2]); S[p] = ent(f[3], f[4]); F[p] = ent(f[5], f[6])
       Z[p] = f[2]; gsub(/./, "0", Z[p])
       next
     }
+    !(p in F) { next }
+    { split(substr($0, 1, t - 1), f, " ") }
     FILENAME == ARGV[2] { if (f[3] != "0") U[p] = 1; else R[p] = ent(f[1], f[2]); next }
     { H[p] = ent(f[1], f[3]) }
     END {
@@ -175,27 +263,22 @@ reconcile() {
         if (h != F[p] || r == F[p]) continue
         if (r == B[p] || r == S[p]) print ((F[p] == "-") ? ("0 " Z[p]) : F[p]) "\t" p
       }
-    }' "$entries" "$split_dir/real" "$split_dir/head" >"$split_dir/stage" || return 0
-  _tries=0
-  while [ -s "$split_dir/stage" ] && ! _err=$(git update-index --index-info <"$split_dir/stage" 2>&1); do
-    _tries=$((_tries + 1))
-    if [ "$_tries" -ge 50 ]; then
-      printf '%s\n' "$_err" >&2
-      echo "auto-commit: committed, but the index could not be brought up to date for these (git add them):" >&2
-      sed "s/^[^$tab]*$tab/  /" "$split_dir/stage" >&2 || true
-      break
-    fi
-    sleep 0.1
-  done
+    }' "$entries" "$split_dir/real" "$split_dir/head" >"$2"
 }
 
 published=0
 reconciled=0
+index_locked=0
 reported=0
 parent=""
 # cleanup STATUS. Reached only through the traps installed below.
 # shellcheck disable=SC2329
 cleanup() {
+  # Stopped while holding index.lock: git would refuse every later write to the
+  # index until someone deleted it by hand.
+  if [ "$index_locked" = 1 ]; then
+    rm -f -- "$index_lock" 2>/dev/null || true
+  fi
   # A signal can land right after update-ref succeeded, before the line that
   # records it: look rather than trust the flag.
   if [ "$published" = 0 ] && [ -n "$parent" ] && [ "$parent" != "$start_head" ] &&
@@ -236,7 +319,7 @@ trap 'cleanup 129; trap - EXIT; exit 129' HUP
 # Snapshot the staging from a copy of the real index. git replaces that file
 # atomically, so the copy is always whole, and write-tree then locks the copy
 # rather than contending for the real index's lock.
-cp -- "$(git rev-parse --git-path index)" "$split_index"
+cp -- "$real_index" "$split_index"
 staged_tree=$(GIT_INDEX_FILE=$split_index git write-tree)
 
 # Walk the snapshot's changes vs base, one raw line per path:
@@ -264,12 +347,13 @@ case $changes in
 esac
 printf '%s\n' "$changes" >"$split_dir/changes"
 
-# Which staged paths already had unstaged changes when the hook started (from
-# the "--prepare" pass). A path NOT listed was clean then, so its current
+# Which staged paths' worktree files could already differ from the staged ones
+# when the hook started (from the "--prepare" pass): unstaged changes, or a
+# file git does not compare. A path NOT listed was clean then, so its current
 # worktree blob is exactly "what was staged, plus any formatter fix": safe to
 # fold in. A listed path keeps its staged blob, preserving partial staging. If
-# the file is absent the prepare pass never ran: every path keeps its staged
-# blob.
+# the file is absent the prepare pass never ran, or could not make its list:
+# every path keeps its staged blob.
 if [ -f "$predirty_file" ]; then
   predirty=$predirty_file
   have_predirty=1
@@ -322,12 +406,28 @@ LC_ALL=C awk -v pre="$predirty" -v havepre="$have_predirty" -v cand="$split_dir/
     for (i = 1; i <= n; i++) if (!(i in moved)) emit(i)
   }' "$predirty" "$split_dir/changes" >"$split_dir/plan"
 
+# beyond_symlink PATH: whether a directory above PATH is a symlink in the
+# worktree. The file PATH names there is then wherever that link points, maybe
+# outside the repository; git itself takes such a path for deleted.
+beyond_symlink() {
+  _p=$1
+  while :; do
+    case $_p in
+      */*) _p=${_p%/*} ;;
+      *) return 1 ;;
+    esac
+    if [ -L "$_p" ]; then
+      return 0
+    fi
+  done
+}
+
 # Only a path that is still a regular file in the worktree can fold: one moved
-# or deleted there since it was staged (unseen by "--prepare" under
-# core.ignoreStat) keeps its staged blob, as any path with unstaged changes
-# does. One mark per candidate, in plan order: H (hashed) or - (staged blob).
+# or deleted there since it was staged, or now below a symlinked directory,
+# keeps its staged blob, as any path with unstaged changes does. One mark per
+# candidate, in plan order: H (hashed) or - (staged blob).
 while IFS= read -r p; do
-  if [ -f "$p" ] && [ ! -L "$p" ]; then
+  if [ -f "$p" ] && [ ! -L "$p" ] && ! beyond_symlink "$p"; then
     printf '%s\n' "$p" >&4
     echo H
   else
