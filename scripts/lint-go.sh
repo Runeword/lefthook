@@ -7,6 +7,13 @@
 # the copy enter_staged_tree (scripts/staged-tree.sh) builds, not as they sit
 # in the working tree, where the package's other files may be mid-edit.
 #
+# lefthook leaves deleted files out of {staged_files} and skips a job left
+# with none, so a commit whose only Go change is a deletion (or a rename to a
+# name without .go) runs this as "lint-go --deletions", from a job with no file
+# template and no glob, which lefthook runs for every commit. That run lints
+# the directories that lost a .go file, and only when no .go file is added or
+# modified: otherwise the job with the files runs and lints them as well.
+#
 # Run golangci-lint from *inside* each directory rather than passing "./$dir"
 # from the repo root: golangci-lint needs a module context (a go.mod at or above
 # its working directory). A repo whose Go code lives in nested modules (e.g.
@@ -19,24 +26,34 @@
 # copy:
 #   - the config golangci-lint would find there (.golangci.* in the directory or
 #     a parent, else in $HOME): the copy's version when the file is staged,
-#     else the working-tree file (an untracked one, or one in a parent
-#     directory, would otherwise silently stop applying); --no-config when
-#     there is none, so nothing above the copy can supply one;
+#     else the working-tree file (an untracked one, one in a parent directory,
+#     or where a symlink leads) placed at its own path under $staged_root, so
+#     that it lies relative to the copy where it lies relative to the working
+#     tree. golangci-lint matches a config's path rules against paths relative
+#     to the config's directory: read where it was, the config met the copy's
+#     files by their cache path, so an exclusion stopped applying and a
+#     path-except started hiding findings. --no-config when there is none, so
+#     nothing above the copy can supply one;
 #   - the go.work `go env GOWORK` names: the copy's version, carried over when
 #     git does not track it, or a rewritten one for a workspace outside the
 #     repository; GOWORK=off when there is none;
 #   - relative `replace` and `use` paths that leave the repository or name a
 #     directory missing from the copy: rewritten to the working tree's path.
 # Git-ignored build inputs of the linted packages and their in-repository
-# dependencies, as `go list` reports them (generated code, cgo headers), are
-# copied in from the working tree. Untracked files git does not ignore stay
-# out: those are work in progress.
+# dependencies, as `go list` reports them (generated code, cgo headers, the
+# files //go:embed takes), are copied in from the working tree; that `go list`
+# runs there, so it may neither write nor download. Untracked files git does
+# not ignore stay out: those are work in progress. So do go's module and build
+# caches, which go reads by absolute path, even where they lie in the
+# repository.
 #
 # golangci-lint runs with GIT_DIR, GIT_WORK_TREE and GIT_INDEX_FILE naming the
 # repository, the copy and the copy's own index, so new-from-rev and
-# new-from-merge-base can diff; the real index is never named. Its cache is
-# this hook's own: it records absolute paths, and the user's shared cache would
-# carry the copy's paths into editor and manual runs.
+# new-from-merge-base can diff; the real index is never named. The go command
+# it runs gets none of them: go fetches a module missing from the module cache
+# with git, in a repository of its own. golangci-lint's cache is this hook's
+# own: it records absolute paths, and the user's shared cache would carry the
+# copy's paths into editor and manual runs.
 #
 # `go` itself comes from the project's toolchain on PATH, not from
 # runtimeInputs: golangci-lint loads packages through it, and the project's
@@ -45,9 +62,20 @@
 # --fix=false: with `issues.fix: true` in its config, golangci-lint would fix
 # the copy, which is thrown away, and stop reporting what it fixed.
 [ "$#" -gt 0 ] || exit 0
-if ! command -v go >/dev/null 2>&1; then
-  echo "lint-go: go is not on PATH; golangci-lint loads packages through the project's Go toolchain" >&2
-  exit 1
+# Read from the real index, before enter_staged_tree leaves the repository.
+lg_deleted=$(git diff --cached --name-only --relative --no-renames --diff-filter=D -z -- '*.go' |
+  xargs -0 -r dirname --)
+if [ "$1" = --deletions ]; then
+  # Run for every commit, Go or not: with no .go file deleted there is nothing
+  # to lint, and no go is needed.
+  [ -n "$lg_deleted" ] || exit 0
+  # Whether lefthook runs the job with the files for this commit: its file
+  # list, ACMR from the top, through the job's glob, which lefthook matches
+  # ignoring case. A pattern still, under `git --literal-pathspecs commit`:
+  # staged-tree.sh, which comes first, unsets GIT_LITERAL_PATHSPECS.
+  lg_changed=$(git diff --cached --name-only --diff-filter=ACMR -- ':(top,icase)*.go')
+  [ -z "$lg_changed" ] || exit 0
+  set --
 fi
 lg_tab=$(printf '\t')
 # Field separator for records with empty fields: read collapses empty
@@ -63,9 +91,10 @@ for lg_f in "$@"; do
       ;;
   esac
 done
-# Read from the real index, before enter_staged_tree leaves the repository.
-lg_deleted=$(git diff --cached --name-only --relative --no-renames --diff-filter=D -z -- '*.go' |
-  xargs -0 -r dirname --)
+if ! command -v go >/dev/null 2>&1; then
+  echo "lint-go: go is not on PATH; golangci-lint loads packages through the project's Go toolchain" >&2
+  exit 1
+fi
 
 enter_staged_tree "$@"
 lg_wt_real=$(cd -- "$staged_worktree" && pwd -P)
@@ -93,6 +122,23 @@ lg_in_copy() {
   else
     printf '%s\n' "$1"
   fi
+}
+
+# lg_beyond REL: whether a directory above REL, a path relative to the top, is
+# a symbolic link or the top of another repository (a submodule). git takes no
+# such path for one of its own, and check-ignore aborts on it, leaving the rest
+# of its input unread.
+lg_beyond() {
+  lg_a=$1
+  while :; do
+    case $lg_a in
+      */*) lg_a=${lg_a%/*} ;;
+      *) return 1 ;;
+    esac
+    if [ -L "$staged_worktree/$lg_a" ] || [ -e "$staged_worktree/$lg_a/.git" ]; then
+      return 0
+    fi
+  done
 }
 
 # lg_relink FILE WTDIR: in FILE, a go.mod or go.work in the copy whose
@@ -153,16 +199,24 @@ lg_workspace() {
   if [ -f "$1.sum" ]; then cp -- "$1.sum" "$2.sum"; fi
 }
 
-# lg_golist DIR: in DIR, the files go builds for the packages in the
-# NUL-separated directories on stdin and for their dependencies.
+# lg_golist DIR: in DIR, the files go builds or embeds for the packages in the
+# NUL-separated directories on stdin and for their dependencies, one
+# "dir<TAB>file" line each: file is relative to the package's dir, except for
+# the test main go generates in its build cache, which is absolute. DIR is in
+# the working tree, where nothing may change: with -mod=mod from GOFLAGS, go list
+# added requirements to go.mod and go.sum there (which a commit staging go.mod
+# then recorded), downloading modules to find them. So $lg_mod (below) in place
+# of that -mod, and no downloads at all: GOPROXY=off, and GONOPROXY=none, or a
+# private module (GOPRIVATE) would still be looked up over https.
 # $d is a Go template variable, not a shell one.
 # shellcheck disable=SC2016
 lg_tmpl='{{if not .Standard}}{{$d := .Dir}}'
-for lg_field in GoFiles CgoFiles CFiles CXXFiles MFiles HFiles FFiles SFiles SwigFiles SwigCXXFiles SysoFiles TestGoFiles XTestGoFiles; do
-  lg_tmpl="$lg_tmpl{{range .$lg_field}}{{\$d}}/{{.}}$lg_nl{{end}}"
+for lg_field in GoFiles CgoFiles CFiles CXXFiles MFiles HFiles FFiles SFiles SwigFiles SwigCXXFiles SysoFiles \
+  TestGoFiles XTestGoFiles EmbedFiles TestEmbedFiles XTestEmbedFiles; do
+  lg_tmpl="$lg_tmpl{{range .$lg_field}}{{\$d}}$lg_tab{{.}}$lg_nl{{end}}"
 done
 lg_tmpl="$lg_tmpl{{end}}"
-lg_golist() { (cd -- "$1" && xargs -0 go list -e -deps -test -f "$lg_tmpl") 2>/dev/null || true; }
+lg_golist() { (cd -- "$1" && GOPROXY=off GONOPROXY=none xargs -0 go list ${lg_mod:+"$lg_mod"} -e -deps -test -f "$lg_tmpl") 2>/dev/null || true; }
 
 # lg_config_for DIR: the config golangci-lint finds when run in working-tree
 # DIR: .golangci.{yml,yaml,toml,json} there or in a parent, up to /, else in
@@ -189,6 +243,22 @@ lg_config_for() {
       return
     fi
   done
+}
+
+# lg_config_in_copy CONFIG: the file to give golangci-lint for CONFIG, a config
+# lg_config_for found: the copy's version when the copy has one, else what
+# CONFIG resolves to (golangci-lint resolves symlinks in the config's path),
+# copied to that same path under $staged_root unless the copy holds it.
+lg_config_in_copy() {
+  if lg_r=$(lg_rel "$1") && [ -f "$staged_copy/$lg_r" ]; then
+    printf '%s\n' "$staged_copy/$lg_r"
+    return
+  fi
+  lg_real=$(readlink -f -- "$1") || return
+  if [ ! -e "$staged_root$lg_real" ]; then
+    mkdir -p -- "$staged_root${lg_real%/*}" && cp -- "$lg_real" "$staged_root$lg_real" || return
+  fi
+  printf '%s\n' "$staged_root$lg_real"
 }
 
 {
@@ -240,6 +310,25 @@ lg_suspect=$(LC_ALL=C awk '
   }
   END { print hit ? "yes" : "no" }' "$staged_scratch/roots" RS='\0' "$staged_scratch/ignored")
 [ "$lg_suspect" = yes ] || : >"$staged_scratch/groups"
+# -mod=readonly when GOFLAGS asks for -mod=mod (the last -mod= wins, as in go).
+# Any other mode only reads: vendor, readonly, or go's default, which picks one
+# of the two. GOFLAGS as `go env` sees it, so a `go env -w` setting counts; a
+# flag, unlike an empty GOFLAGS, overrides that setting. Read from /, since
+# GOFLAGS does not depend on the directory, and neither do go's caches (below).
+lg_mod=""
+lg_caches=""
+if [ -s "$staged_scratch/groups" ]; then
+  lg_mod=$( (cd / && go env GOFLAGS) | awk '
+    { for (i = 1; i <= NF; i++) if ($i ~ /^--?mod=/) m = $i }
+    END { if (m ~ /=mod$/) print "-mod=readonly" }') || lg_mod=-mod=readonly
+  lg_caches=$(cd / && go env GOMODCACHE GOCACHE) || lg_caches=""
+fi
+# Into missing: each file go lists that lies in the repository, as a path
+# relative to the top, where the copy lacks it and git takes it for a path of
+# its own (lg_beyond). Never one in go's module or build cache, which go reads
+# by absolute path even where it lies in the repository (direnv's `layout go`
+# puts GOPATH there): a module cache is thousands of read-only files, and the
+# test main of a package with tests is in the build cache.
 {
   lg_root=""
   while IFS="$lg_us" read -r lg_gomod lg_wt; do
@@ -257,14 +346,36 @@ lg_suspect=$(LC_ALL=C awk '
     printf '%s\0' "$lg_wt" >>"$staged_scratch/group"
   done <"$staged_scratch/groups"
   if [ -n "$lg_root" ]; then lg_golist "$lg_root" <"$staged_scratch/group"; fi
-} | sort -u | while IFS= read -r lg_file; do
-  if lg_r=$(lg_rel "$lg_file") && [ ! -e "$staged_copy/$lg_r" ]; then printf '%s\0' "$lg_r"; fi
+} | lg_caches=$lg_caches lg_top=$staged_worktree lg_top_real=$lg_wt_real LC_ALL=C awk '
+  BEGIN {
+    n = split(ENVIRON["lg_caches"], cache, "\n")
+    top = ENVIRON["lg_top"] "/"
+    real = ENVIRON["lg_top_real"] "/"
+  }
+  {
+    t = index($0, "\t")
+    file = substr($0, t + 1)
+    path = (file ~ /^\//) ? file : substr($0, 1, t - 1) "/" file
+    for (i = 1; i <= n; i++)
+      if (cache[i] ~ /^\// && index(path, cache[i] "/") == 1) next
+    if (index(path, top) == 1) print substr(path, length(top) + 1)
+    else if (index(path, real) == 1) print substr(path, length(real) + 1)
+  }' | sort -u | while IFS= read -r lg_r; do
+  if [ -f "$staged_worktree/$lg_r" ] && [ ! -e "$staged_copy/$lg_r" ] && ! lg_beyond "$lg_r"; then
+    printf '%s\0' "$lg_r"
+  fi
 done >"$staged_scratch/missing"
 : >"$staged_scratch/carry"
 if [ -s "$staged_scratch/missing" ]; then
-  # Only what git ignores: an untracked file it does not ignore is unfinished work.
+  # Only what git ignores: an untracked file it does not ignore is unfinished
+  # work. check-ignore exits 1 when it ignores none of them, and above that
+  # when it fails, which it does at the first path it refuses.
+  lg_rc=0
   GIT_DIR=$staged_git_dir GIT_WORK_TREE=$staged_worktree git -C "$staged_worktree" \
-    check-ignore --stdin -z <"$staged_scratch/missing" >"$staged_scratch/carry" || true
+    check-ignore --stdin -z <"$staged_scratch/missing" >"$staged_scratch/carry" || lg_rc=$?
+  if [ "$lg_rc" -gt 1 ]; then
+    echo "lint-go: git check-ignore failed, so git-ignored files the build needs may be missing from the copy" >&2
+  fi
 fi
 # Plus an in-repository go.work and its go.work.sum the copy lacks, ignored or
 # not: Go's advice is not to commit them, so they are rarely tracked.
@@ -277,7 +388,9 @@ done >>"$staged_scratch/carry"
 if [ -s "$staged_scratch/carry" ]; then
   (cd -- "$staged_worktree" && xargs -0 cp --parents --no-dereference --preserve=mode -t "$staged_copy" --) <"$staged_scratch/carry"
   lg_n=$(tr -cd '\0' <"$staged_scratch/carry" | wc -c)
-  lg_names=$(tr '\0' '\n' <"$staged_scratch/carry" | head -3 | tr '\n' ' ')
+  # awk reads to the end; `| head` exits early, and under pipefail the writer it
+  # leaves without a reader fails the hook.
+  lg_names=$(LC_ALL=C awk 'BEGIN { RS = "\0" } NR <= 3 { printf "%s ", $0 }' "$staged_scratch/carry")
   echo "lint-go: using $lg_n untracked file(s) from the working tree: $lg_names" >&2
 fi
 
@@ -290,6 +403,17 @@ cut -d "$lg_us" -f3,4 "$staged_scratch/plan" | tr "$lg_us" '\n' | sort -u | whil
     lg_relink "$staged_copy/$lg_r" "$(dirname -- "$lg_file")"
   fi
 done
+
+# golangci-lint finds go through a shim that drops GIT_DIR, GIT_WORK_TREE and
+# GIT_INDEX_FILE, which golangci-lint itself gets (below). go fetches a module
+# missing from the module cache with git, in a bare repository it creates with
+# `git init --bare`: with them set, that git refused to run, and with GIT_DIR
+# alone it would have turned this repository bare.
+lg_go=$(command -v go | awk '{ gsub(/\047/, "\047\\\047\047"); printf "\047%s\047", $0 }')
+mkdir -m 700 -- "$staged_scratch/bin"
+# shellcheck disable=SC2016
+printf '#!/bin/sh\nunset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE\nexec %s "$@"\n' "$lg_go" >"$staged_scratch/bin/go"
+chmod 700 -- "$staged_scratch/bin/go"
 
 lg_failed=0
 lg_n=0
@@ -310,14 +434,16 @@ while IFS="$lg_us" read -r lg_dir lg_wt lg_gomod lg_gowork lg_config; do
   esac
   if [ -z "$lg_config" ]; then
     lg_config=--no-config
-  elif lg_r=$(lg_rel "$lg_config") && [ -f "$staged_copy/$lg_r" ]; then
-    lg_config=--config=$staged_copy/$lg_r
+  elif lg_placed=$(lg_config_in_copy "$lg_config"); then
+    lg_config=--config=$lg_placed
   else
-    lg_config=--config=$lg_config
+    echo "lint-go: could not place $lg_config beside the copy of the staged tree" >&2
+    lg_failed=1
+    continue
   fi
   if ! (
     cd -- "$lg_dir" &&
-      GOWORK=$lg_gowork GOLANGCI_LINT_CACHE=$staged_cache/golangci-lint \
+      PATH=$staged_scratch/bin:$PATH GOWORK=$lg_gowork GOLANGCI_LINT_CACHE=$staged_cache/golangci-lint \
         GIT_DIR=$staged_git_dir GIT_WORK_TREE=$staged_copy GIT_INDEX_FILE=$staged_index \
         golangci-lint run --fix=false "$lg_config" .
   ); then
