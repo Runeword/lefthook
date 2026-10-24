@@ -21,7 +21,11 @@
 enter_staged_tree "$@"
 
 # lo_plugin_dir DIR: point a relative plugin_dir in the copy's DIR/.tflint.hcl
-# at the working tree's DIR, where tflint run from DIR would have put it.
+# at the working tree's DIR, where tflint run from DIR would have put it. The
+# file goes to awk on stdin: an operand like env=prod/.tflint.hcl is a variable
+# assignment to awk, which then read the loop's list of directories instead,
+# leaving that config empty (its rules off) or holding the next directory's
+# name, a directory then never linted.
 lo_plugin_dir() {
   [ -f "$1/.tflint.hcl" ] || return 0
   lo_wt=$(cd -- "$staged_worktree/$staged_prefix$1" 2>/dev/null && pwd) || return 0
@@ -30,7 +34,7 @@ lo_plugin_dir() {
       rest = substr($0, RLENGTH + 1)
       if (rest !~ /^[\/~"]/) $0 = substr($0, 1, RLENGTH) ENVIRON["lo_wt"] "/" rest
     }
-    { print }' "$1/.tflint.hcl" >"$staged_scratch/tflint.hcl"
+    { print }' <"$1/.tflint.hcl" >"$staged_scratch/tflint.hcl"
   mv -- "$staged_scratch/tflint.hcl" "$1/.tflint.hcl"
 }
 
