@@ -21,33 +21,32 @@
           }
         );
 
+      # mkBehaviourCheck PKGS NAME EXTRA-INPUTS ENV: tests/NAME.sh, with
+      # EXTRA-INPUTS on PATH and ENV, the wrappers and renders it uses, in its
+      # environment. Only those: a change to another wrapper does not run it
+      # again.
       mkBehaviourCheck =
-        pkgs: name: extraInputs:
-        let
-          wrappers = import ./wrappers.nix { inherit pkgs; };
-          bin = w: "${wrappers.${w}}/bin/${w}";
-        in
+        pkgs: name: extraInputs: env:
         pkgs.runCommand "check-behaviour-${name}"
-          {
-            nativeBuildInputs = [
-              pkgs.coreutils
-              pkgs.diffutils
-              pkgs.findutils
-              pkgs.gawk
-              pkgs.git
-              pkgs.gnugrep
-              pkgs.gnused
-              pkgs.lefthook
-              pkgs.procps
-            ]
-            ++ extraInputs;
-            AUTO_COMMIT = bin "auto-commit";
-            LINT_GO = bin "lint-go";
-            LINT_OPENTOFU = bin "lint-opentofu";
-            SECURITY_OPENTOFU = bin "security-opentofu";
-            REAL_GIT = "${pkgs.git}/bin/git";
-            TEST_LIB = ./tests/lib.sh;
-          }
+          (
+            {
+              nativeBuildInputs = [
+                pkgs.coreutils
+                pkgs.diffutils
+                pkgs.findutils
+                pkgs.gawk
+                pkgs.git
+                pkgs.gnugrep
+                pkgs.gnused
+                pkgs.lefthook
+                pkgs.procps
+              ]
+              ++ extraInputs;
+              REAL_GIT = "${pkgs.git}/bin/git";
+              TEST_LIB = ./tests/lib.sh;
+            }
+            // env
+          )
           ''
             export HOME=$TMPDIR/home
             mkdir -p "$HOME"
@@ -130,6 +129,12 @@
           lib,
           ...
         }:
+        let
+          hooks = import ./hooks.nix { inherit pkgs; };
+          wrappers = import ./wrappers.nix { inherit pkgs; };
+          bin = w: "${wrappers.${w}}/bin/${w}";
+          render = args: (self.lib.${system}.mkShell args).lefthookConfig;
+        in
         {
           # The dev shell exercises 4 of the 9 lanes, so without this the go,
           # lua, opentofu, rust and zig hooks are never rendered, never loaded
@@ -148,11 +153,7 @@
           lefthook-all-lanes =
             let
               args = {
-                lanes = lib.attrNames (
-                  lib.groupBy (h: h.lane) (
-                    lib.filter (h: h ? lane) (lib.attrValues (import ./hooks.nix { inherit pkgs; }))
-                  )
-                );
+                lanes = lib.attrNames (lib.groupBy (h: h.lane) (lib.filter (h: h ? lane) (lib.attrValues hooks)));
                 gitleaks = true;
                 autoCommit = true;
               };
@@ -165,6 +166,20 @@
                   paths = map (p: p.drvPath) (self.lib.${system}.toolchain args);
                 in
                 builtins.deepSeq paths (builtins.length paths);
+              # lefthook-init's install command passes `only` the missing
+              # programs by the first word of their `run:` (past any
+              # VAR=value), plus lefthook. toolchainEnv throws when no package
+              # has such a name as its main program: forced here, that happens
+              # in this repository instead of at a consumer.
+              onlyResolves =
+                let
+                  runs = lib.concatMap (h: map (j: j.run) (h.jobs ++ (h.prepareJobs or [ ]))) (lib.attrValues hooks);
+                  program = run: lib.elemAt (builtins.match "([A-Za-z_][A-Za-z0-9_]*=[^ ]* )*([^ ]+).*" run) 1;
+                  env = self.lib.${system}.toolchainEnv (
+                    args // { only = lib.unique (map program runs) ++ [ "lefthook" ]; }
+                  );
+                in
+                builtins.seq env.drvPath true;
             in
             pkgs.runCommand "check-lefthook-all-lanes"
               {
@@ -172,7 +187,7 @@
                   pkgs.git
                   pkgs.lefthook
                 ];
-                inherit toolsInstantiated;
+                inherit toolsInstantiated onlyResolves;
               }
               ''
                 export HOME="$TMPDIR"
@@ -194,17 +209,60 @@
           # exported `mkHooksCheck` consumers use.
           lefthook-hooks = self.devShells.${system}.default.mkHooksCheck self;
 
+          # The same check over consumer-shaped repositories: it runs their
+          # own lefthook config, not a stub in its place.
+          lefthook-hooks-own-config = import ./tests/hooks-check.nix {
+            inherit pkgs;
+            inherit (self.lib.${system}) mkShell;
+          };
+
           # Behavioural checks: tests/<name>.sh drives the wrappers through
           # real commits in the build sandbox (real git and lefthook, no
           # network, a throwaway HOME). A known limitation is recorded as an
           # expected failure, so these go red on a regression AND when a
           # limitation is lifted without its documentation being updated.
-          behaviour-auto-commit = mkBehaviourCheck pkgs "auto-commit" [ ];
-          behaviour-staged-tree = mkBehaviourCheck pkgs "staged-tree" [
-            # golangci-lint loads packages through the go command; the wrapper
-            # takes it from the project's own toolchain, so supply one here.
-            pkgs.go
-          ];
+          # The renders a suite commits through make it go red when the render
+          # changes what it pins.
+          behaviour-auto-commit = mkBehaviourCheck pkgs "auto-commit" [ ] {
+            AUTO_COMMIT = bin "auto-commit";
+          };
+          # yamlfmt for the formatter of GUARD_CONFIG. The renders: a
+          # formatter's (the guard first), one where nothing stages a fix (no
+          # guard), and a formatter's with auto-commit but no guard job, as
+          # configs rendered before the guard existed start.
+          behaviour-pathspec-guard = mkBehaviourCheck pkgs "pathspec-guard" [ pkgs.yamlfmt ] {
+            AUTO_COMMIT = bin "auto-commit";
+            PATHSPEC_GUARD = bin "pathspec-guard";
+            GUARD_CONFIG = render { hooks.format-yaml.enable = true; };
+            NO_STAGING_CONFIG = render {
+              gitleaks = true;
+              autoCommit = true;
+            };
+            PREPARE_ONLY_CONFIG = render {
+              lanes = [ "yaml" ];
+              autoCommit = true;
+              hooks.pathspec-guard.enable = false;
+            };
+          };
+          behaviour-security-gitleaks = mkBehaviourCheck pkgs "security-gitleaks" [ ] {
+            SECURITY_GITLEAKS = bin "security-gitleaks";
+          };
+          # golangci-lint loads packages through the go command; the wrapper
+          # takes it from the project's own toolchain, so supply one here. And
+          # git-lfs, for a repository whose LFS objects were never downloaded.
+          # The render: lint-go's jobs as the go lane renders them.
+          behaviour-staged-tree =
+            mkBehaviourCheck pkgs "staged-tree"
+              [
+                pkgs.go
+                pkgs.git-lfs
+              ]
+              {
+                LINT_GO = bin "lint-go";
+                LINT_OPENTOFU = bin "lint-opentofu";
+                SECURITY_OPENTOFU = bin "security-opentofu";
+                LINT_GO_CONFIG = render { hooks.lint-go.enable = true; };
+              };
         }
       );
     };
