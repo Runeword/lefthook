@@ -1,10 +1,12 @@
 # Module-style factory that turns a set of enabled hooks into a dev shell.
 #
 # Ordering is expressed as data, not inferred from attribute-set order:
+#   - `guard` jobs (pathspec-guard) come first,
 #   - lanes run in parallel under a `main` job,
 #   - jobs within a lane are piped in `order` (format -> lint -> security),
 #   - `finalize` jobs (auto-commit) come after `main`,
-#   - `pre-commit` itself is piped, so a failing lane blocks `finalize`.
+#   - `pre-commit` itself is piped, so a failing guard blocks everything and a
+#     failing lane blocks `finalize`.
 #
 # The rendered config calls tools by bare name and is copied into the
 # consumer's repo as `lefthook-generated.yml`, meant to be committed: hooks
@@ -53,10 +55,11 @@ let
       count (b: b) [
         (h ? lane)
         (h.standalone or false)
+        (h.guard or false)
         (h.finalize or false)
       ] != 1
     then
-      throw "hooks.nix: hook '${name}' must declare exactly one of lane/standalone/finalize"
+      throw "hooks.nix: hook '${name}' must declare exactly one of lane/standalone/guard/finalize"
     else if h ? lane && !(h ? order) then
       throw "hooks.nix: laned hook '${name}' must declare an order"
     else
@@ -93,23 +96,25 @@ let
         )
       );
 
-  # `finalize` jobs are piped after `main`, so with more than one of them the
-  # sequence would fall back to attribute name — the same failure
-  # `validLaneOrders` exists to reject for lanes. Latent while auto-commit is
-  # the only finalize hook; guarded before it stops being.
-  validFinalizeOrders =
+  # `guard` jobs are piped before everything else and `finalize` jobs after
+  # `main`, so with more than one hook in either role the sequence would fall
+  # back to attribute name — the same failure `validLaneOrders` exists to
+  # reject for lanes. Latent while each role has a single hook; guarded before
+  # that stops being.
+  validRoleOrders =
+    role:
     let
-      finalize = filter (h: h.finalize or false) (attrValues hooks);
+      inRole = filter (h: h.${role} or false) (attrValues hooks);
       nameOf = h: head (filter (n: hooks.${n} == h) (attrNames hooks));
-      names = concatStringsSep ", " (map nameOf finalize);
-      orders = map (h: h.order or null) finalize;
+      names = concatStringsSep ", " (map nameOf inRole);
+      orders = map (h: h.order or null) inRole;
     in
-    if builtins.length finalize <= 1 then
+    if builtins.length inRole <= 1 then
       true
     else if elem null orders then
-      throw "hooks.nix: with more than one finalize hook each must declare an order (${names})"
+      throw "hooks.nix: with more than one ${role} hook each must declare an order (${names})"
     else if unique orders != orders then
-      throw "hooks.nix: duplicate order among finalize hooks (${names})"
+      throw "hooks.nix: duplicate order among ${role} hooks (${names})"
     else
       true;
 
@@ -137,7 +142,8 @@ let
   hooksValid =
     builtins.all (name: validHook name hooks.${name}) (attrNames hooks)
     && validLaneOrders
-    && validFinalizeOrders
+    && validRoleOrders "guard"
+    && validRoleOrders "finalize"
     && validShorthands;
 
   # Build the `pre-commit` settings block from the enabled hook names.
@@ -148,6 +154,7 @@ let
 
       laned = filter (h: h ? lane) enabled;
       standalone = filter (h: h.standalone or false) enabled;
+      guard = filter (h: h.guard or false) enabled;
       finalize = filter (h: h.finalize or false) enabled;
 
       # One piped group per lane, jobs ordered format -> lint -> security.
@@ -166,23 +173,26 @@ let
         };
 
       mainJobs = map laneGroup enabledLanes ++ concatMap (h: h.jobs) standalone;
-      # Sorted by `order`, not attribute name — validFinalizeOrders requires one
-      # as soon as there is more than a single finalize hook to sequence.
-      finalizeJobs = concatMap (h: h.jobs) (sort (a: b: (a.order or 0) < (b.order or 0)) finalize);
-      # Jobs an enabled hook contributes to the HEAD of the piped pre-commit,
-      # before `main`, so they observe the worktree before any formatter touches
-      # it (auto-commit's `--prepare` snapshot). A single source today, so
-      # attribute order is deterministic without an ordering validator like the
-      # finalize one; add that guard here if a second hook ever contributes.
+      # Sorted by `order`, not attribute name — validRoleOrders requires one as
+      # soon as there is more than a single hook in the role to sequence.
+      byOrder = sort (a: b: (a.order or 0) < (b.order or 0));
+      guardJobs = concatMap (h: h.jobs) (byOrder guard);
+      finalizeJobs = concatMap (h: h.jobs) (byOrder finalize);
+      # Jobs an enabled hook contributes ahead of `main`, after the guards, so
+      # they observe the worktree before any formatter touches it
+      # (auto-commit's `--prepare` snapshot). A single source today, so
+      # attribute order is deterministic without an ordering validator like
+      # validRoleOrders; add one here if a second hook ever contributes.
       prepareJobs = concatMap (h: h.prepareJobs or [ ]) enabled;
     in
     {
       piped = true;
       # `main` is omitted when empty (e.g. only auto-commit enabled): lefthook
-      # errors out on a group with no jobs. Prepare jobs lead it and finalize
-      # jobs follow, all sequenced by the top-level `piped`.
+      # errors out on a group with no jobs. Guard jobs lead it, then prepare
+      # jobs, and finalize jobs follow, all sequenced by the top-level `piped`.
       jobs =
-        prepareJobs
+        guardJobs
+        ++ prepareJobs
         ++ optional (mainJobs != [ ]) {
           name = "main";
           group = {
@@ -200,6 +210,16 @@ let
       enabledHooks = map (name: hooks.${name}) enabledNames;
       # Every package the enabled hooks call by bare name.
       hookTools = concatMap (h: h.tools) enabledHooks;
+      # Whether an enabled hook other than a guard has a job that stages its
+      # fix: lefthook then hands the staged names to git as patterns, which is
+      # what a guard checks first. Guards are left out of the test, so a
+      # guard's own default never depends on itself.
+      staging = builtins.any (
+        name:
+        !(hooks.${name}.guard or false)
+        && config.hooks.${name}.enable
+        && builtins.any (j: j.stage_fixed or false) hooks.${name}.jobs
+      ) (attrNames hooks);
     in
     {
       options = {
@@ -302,7 +322,8 @@ let
             (hookTools ++ [ pkgs.lefthook ]);
 
         # The shorthands are mkDefault so an explicit hooks.<name>.enable — in
-        # either direction — takes precedence over them.
+        # either direction — takes precedence over them. So is a guard's
+        # default, on wherever an enabled job stages its fix.
         hooks = mapAttrs (
           name: h:
           let
@@ -310,9 +331,10 @@ let
             byFlag = builtins.any (flag: shorthandHooks.${flag} == name && config.${flag}) (
               attrNames shorthandHooks
             );
+            byStaging = (h.guard or false) && staging;
           in
           {
-            enable = mkDefault (byLane || byFlag);
+            enable = mkDefault (byLane || byFlag || byStaging);
           }
         ) hooks;
 
@@ -430,13 +452,17 @@ let
                     touch "$out"
                   '';
               # The hooks themselves, run over every file of `src` the way the
-              # README's CI command runs them: a linter failure or a file a
-              # formatter would change fails the check. In a fresh repository
-              # with everything staged, security-gitleaks scans the whole tree.
-              # Excluded: auto-commit (it would commit) and the jobs that need
-              # the network or the project's own toolchain, which the build
-              # sandbox has neither of (Go modules for lint-go, tflint plugins,
-              # trivy's checks bundle) — run those with the CI command.
+              # README's CI command runs them, through the repository's own
+              # lefthook config: a linter failure or a file a formatter would
+              # change fails the check. In a fresh repository with everything
+              # staged, security-gitleaks scans the whole tree.
+              # Excluded: auto-commit (it would commit), pathspec-guard (with
+              # everything staged and nothing committed it has nothing to
+              # guard, and a name it refuses would only fail the check), and
+              # the jobs that need the network or the project's own toolchain,
+              # which the build sandbox has neither of (Go modules for lint-go,
+              # tflint plugins, trivy's checks bundle) — run those with the CI
+              # command.
               mkHooksCheck =
                 src:
                 let
@@ -447,18 +473,34 @@ let
                 pkgs.runCommand "check-lefthook-hooks"
                   {
                     nativeBuildInputs = config.toolchain ++ [ pkgs.git ];
-                    LEFTHOOK_EXCLUDE = "auto-commit,auto-commit-prepare,lint-go,lint-opentofu,security-opentofu";
+                    # Every job of the hooks named above.
+                    LEFTHOOK_EXCLUDE = concatStringsSep "," (
+                      concatMap (name: map (j: j.name) (hooks.${name}.jobs ++ (hooks.${name}.prepareJobs or [ ]))) [
+                        "auto-commit"
+                        "pathspec-guard"
+                        "lint-go"
+                        "lint-opentofu"
+                        "security-opentofu"
+                      ]
+                    );
                   }
                   ''
                     export HOME="$TMPDIR"
                     cp -r --no-preserve=mode ${root} "$TMPDIR/src"
                     cd "$TMPDIR/src"
-                    # This shell's own render, whatever is committed (drift is
-                    # mkConfigCheck's job), written before staging so the files
-                    # are part of the tree the hooks see like everything else.
-                    cp ${configFile} lefthook-generated.yml
-                    printf 'extends:\n  - lefthook-generated.yml\n' >lefthook.yml
                     git init -q
+                    # Wired as lefthook-init wires a checkout, minus the hooks:
+                    # this shell's own render, whatever is committed (drift is
+                    # mkConfigCheck's job), and the stub lefthook.yml only where
+                    # the repository has no main config under any name lefthook
+                    # reads, so that its own config runs, as its commits load
+                    # it. (Written regardless, the stub replaced a lefthook.yml
+                    # and shadowed any other name.) Before staging, so that the
+                    # files are part of the tree the hooks see like everything
+                    # else, and writable, as in a checkout: a formatter that
+                    # would change the render must fail the check for that, not
+                    # for a read-only copy.
+                    ${wrappers.wire-repo}/bin/wire-repo ${configFile} lefthook --no-install
                     # --force: the source is exactly the tracked files, some of
                     # which a .gitignore may match.
                     git add --all --force
@@ -508,11 +550,26 @@ in
 
   # The same packages as one installable environment, for
   # `nix profile install` — the command `lefthook-init` prints when the tools
-  # its config calls are not on PATH.
+  # its config calls are not on PATH. Same arguments as `mkShell`, plus an
+  # optional `only`: the programs to install, by the bare name a `run:` line
+  # calls them. lefthook-init passes the ones missing from PATH: a package the
+  # profile already has (lefthook, typically: the scaffolder just ran it)
+  # collides with its copy here and fails the whole install. A name no package
+  # provides fails here, rather than install less than was asked for.
   toolchainEnv =
-    userConfig:
-    pkgs.buildEnv {
-      name = "lefthook-toolchain";
-      paths = (eval userConfig).toolchain;
-    };
+    args:
+    let
+      packages = (eval (if builtins.isAttrs args then removeAttrs args [ "only" ] else args)).toolchain;
+      program = p: p.meta.mainProgram or (lib.getName p);
+      programs = map program packages;
+      only = args.only or programs;
+      unknown = lib.subtractLists programs only;
+    in
+    if unknown != [ ] then
+      throw "lefthook: toolchainEnv: no package of this toolchain provides ${concatStringsSep ", " unknown}"
+    else
+      pkgs.buildEnv {
+        name = "lefthook-toolchain";
+        paths = filter (p: elem (program p) only) packages;
+      };
 }
