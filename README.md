@@ -33,9 +33,11 @@ entered the shell commits with no checks at all.
 
 Every hook's `run:` command calls its tool by bare name, resolved from the dev
 shell `PATH`, so the generated config is machine-independent. A commit made
-outside the dev shell fails loudly with `command not found` instead of
-silently running stale or missing tools. Unknown hook names fail at evaluation
-with a NixOS-module-style "Did you mean…?" suggestion.
+outside the dev shell runs whatever `PATH` holds under those names: where
+nothing does, it fails with `command not found`; where a global install of the
+toolchain does (a home-manager package list, `nix profile`), that install's
+tools run, at whatever revision it was built from. Unknown hook names fail at
+evaluation with a NixOS-module-style "Did you mean…?" suggestion.
 
 `lefthook-local.yml` is left entirely to you — it is lefthook's own per-user
 override file and is merged automatically. Shell entry adds it to
@@ -61,8 +63,10 @@ still supported — lefthook is not locked out.
 The config calls its tools by bare name, so they have to be on `PATH` before
 the first commit — from a dev shell, or [installed
 globally](#installing-the-tools-globally). The scaffolder checks: when some are
-missing it names them and prints the exact `nix profile install` command for
-the set this config calls. Once they are there, commit the two files.
+missing it names them and prints a `nix profile install` command for just
+those, from the flake you ran. `go` is named but left out of that command:
+`lint-go` lints with your project's own Go toolchain. Once they are there,
+commit the two files.
 
 **`gitleaks` is on by default; `auto-commit` is opt-in** (`--auto-commit`). It
 splits every commit into one commit per file and cancels the umbrella commit,
@@ -109,15 +113,24 @@ one-command setup. Adding a language later means adding a lane here and
 re-running `home-manager switch` — not editing each repository.
 
 Without home-manager, `lib.<system>.toolchainEnv` takes the same arguments and
-returns those packages as one environment for your Nix profile — the command
-`lefthook-init` prints when tools are missing:
+returns those packages as one environment for your Nix profile:
 
 ```sh
 nix profile install --impure --expr '(builtins.getFlake "github:Runeword/lefthook").lib.x86_64-linux.toolchainEnv { lanes = [ "nix" "shell" ]; gitleaks = true; }'
 ```
 
+`only` keeps just the programs it names, by the name the config calls them.
+A package your profile already has (`lefthook`, say) collides with its copy
+in the environment and fails the whole install, so `lefthook-init` prints
+this command with `only` set to what is missing, and with the store path of
+the flake you ran in place of `github:Runeword/lefthook`:
+
+```sh
+nix profile install --impure --expr '(builtins.getFlake "github:Runeword/lefthook").lib.x86_64-linux.toolchainEnv { lanes = [ "nix" "shell" ]; gitleaks = true; only = [ "shfmt" "shellcheck" ]; }'
+```
+
 The wrapper scripts are also exposed individually as
-`packages.<system>.{auto-commit,security-gitleaks,security-opentofu,lint-nix,lint-go,lint-opentofu}`
+`packages.<system>.{auto-commit,pathspec-guard,security-gitleaks,security-opentofu,lint-nix,lint-go,lint-opentofu}`
 (plus `wire-repo` and `lefthook-init`, which are tooling rather than hooks).
 
 ## Installation as a flake input
@@ -175,10 +188,67 @@ order and stop on first failure. `auto-commit` runs afterwards (declared
 `finalize`), and `pre-commit` itself is piped — so a failing formatter or
 linter blocks `auto-commit` entirely. Formatters carry `stage_fixed`, so their
 fixes are staged (lefthook ≥ 2.1.7 does that after the last job; auto-commit
-folds them into its commits either way).
+folds them into its commits either way). Wherever a formatter is enabled,
+`pathspec-guard` runs before everything else (declared `guard`, see below).
 
 All of this is derived from data in `hooks.nix`, so the order is fixed and
 cannot drift with how the attrset happens to be enumerated.
+
+### File names that read as patterns
+
+lefthook hands the staged file names to git as patterns (pathspecs) when it
+stages a formatter's fix, ignored files included: staging `g*.txt` also staged
+an ignored `gsecret.txt`, and committed it. So wherever an enabled hook stages
+its fix, the first job is `pathspec-guard`. It blocks the commit, with the
+reason listed, when a staged name:
+- starts with `:`, which git reads as pathspec magic;
+- starts or ends with a blank, or is wrapped in backquotes or single quotes,
+  which lefthook strips before it calls git;
+- holds `*`, `?`, `[` or `\` and, read as a pattern, matches some other file,
+  ignored ones included.
+
+A route file such as `app/[id]/page.tsx` matches only itself and commits as
+usual. Otherwise rename the file, or move what it matches; `--no-verify` skips
+every hook. The check runs during merges and rebases too, because the
+formatters do. It comes after lefthook has set aside the unstaged changes of
+partially staged files, a step that already reads their names as patterns.
+With auto-commit on, `auto-commit-prepare` runs the same check, for configs
+rendered from 2026-08-15, when that job appeared, until `pathspec-guard`
+existed. A config rendered before that has neither job, and gets the check
+once you regenerate it. A commit made with `git --literal-pathspecs` (magit's
+default) has git read every name as itself, so a pattern goes through then.
+
+`pathspec-guard` also keeps a copy of lefthook's backup of your unstaged
+changes: see the next section.
+
+### Unstaged edits that a formatter's fix collides with
+
+When you commit part of a file, lefthook sets the unstaged edits aside before
+the hooks and puts them back after. If an unstaged edit touches a line that a
+formatter rewrote, it cannot:
+- before 2.1.7 the commit goes through with a warning, and that edit is gone
+  from your working tree;
+- from 2.1.7 to 2.1.15 lefthook first resets every tracked file, so the
+  unstaged edits of all your other files go too;
+- from 2.1.16 nothing is lost, except with auto-commit (still so in 2.2.2):
+  its split has moved the index, and none of the edits come back.
+
+Without auto-commit, 2.1.7 and later also stop the commit.
+
+Every one of those edits is in lefthook's stash, `lefthook auto backup`, but
+lefthook deletes it, right away or at a later commit that sets edits aside.
+So `pathspec-guard`, the first job wherever a formatter stages its fix,
+copies each such stash to `refs/lefthook/backup`, whose reflog keeps them (for
+30 days, git's default for entries like these):
+
+    git reflog refs/lefthook/backup                  # the copies, newest (@{0}) first
+    git stash show -p 'refs/lefthook/backup@{0}'     # what one holds
+    git restore --source='refs/lefthook/backup@{0}' -- path/to/file
+
+`git restore` replaces the file in your working tree with the version in the
+copy; `git show 'refs/lefthook/backup@{0}:path/to/file'` prints it instead.
+The local edit of a file marked assume-unchanged has no copy: git leaves such
+files out of a stash.
 
 ### Package-level checks see the staged tree
 
@@ -188,28 +258,40 @@ tree, so an unstaged edit or an untracked file elsewhere in the package cannot
 fail a commit, nor make one pass that only works together with it. Where the
 working tree matches the index the copy takes the working-tree file, as git
 checked it out (decrypted, smudged, your line endings); elsewhere it takes the
-staged blob. The staged files come as the formatter left them, and submodules
-at their recorded commit.
+staged blob as git stores it, with your line endings but without running any
+filter driver, so nothing is downloaded from LFS. The staged files come as the
+formatter left them, and submodules at their recorded commit.
 
 The copy lives in `${XDG_CACHE_HOME:-~/.cache}/lefthook/staged/<repo>/<hook>/`:
-one directory per repository and hook, writable only by you, locked while a
-commit uses it, rebuilt on every run and removed afterwards. `lint-go` keeps
-golangci-lint's cache there too, so your editor's golangci-lint never sees the
-copy's paths. A copy that a killed run (^C) leaves behind is reclaimed by the
-next run; idle copies of other repositories are deleted after an hour.
+one directory per working tree and hook (a linked worktree gets its own),
+writable only by you, locked while a commit uses it, rebuilt on every run and
+removed afterwards. `lint-go` keeps golangci-lint's cache there too, so your
+editor's golangci-lint never sees the copy's paths, and no worktree sees
+another's. A copy that a killed run (^C) leaves behind is reclaimed by the
+next run; idle copies of other working trees are deleted after an hour.
+Inside that directory the copy sits at `tree/` followed by your working tree's
+full path, so that a file from outside the repository can be put where it lies
+relative to your working tree.
 
 What a tool finds by location still comes from your working tree:
 - `lint-go`:
   - the golangci-lint config your working tree would use, including an
-    untracked one or one in a parent directory;
+    untracked one, one in a parent directory or in `$HOME`, and one reached
+    through a symlink. It is placed so that its path rules (`path`,
+    `path-except`) match the same files they match in your working tree;
   - the active `go.work`, including an untracked one or one above the
     repository;
   - `replace`/`use` paths that point outside the repository;
   - the git-ignored files the linted packages build, as `go list` reports them
-    (generated code, cgo headers).
+    (generated code, cgo headers, files that `//go:embed` takes). That
+    `go list` leaves your working tree alone: it downloads nothing, and reads
+    a `-mod=mod` in `GOFLAGS` as `-mod=readonly`, so it cannot add
+    requirements to your `go.mod`.
   Untracked files that git does not ignore stay out: those are work in
-  progress. golangci-lint can still diff against git, so `new-from-rev` and
-  `new-from-merge-base` work.
+  progress. So does go's module cache, even inside the repository (as with
+  direnv's `layout go`): go finds it there by itself. golangci-lint can still
+  diff against git, so `new-from-rev` and `new-from-merge-base` work, and go
+  still fetches a private module with git when the module cache lacks it.
 - `lint-opentofu` and `security-opentofu`: the modules `tofu init` downloaded
   (`.terraform/modules`), and tflint's plugin directory (a relative
   `plugin_dir`, or `./.tflint.d/plugins`), so plugins are installed once, not on
@@ -219,8 +301,19 @@ What a tool finds by location still comes from your working tree:
 calls, and skips the other root modules below it. If trivy cannot load a module
 call, the commit fails (run `tofu init`) instead of the module going unscanned.
 
+`lint-go` also lints the packages that lost a `.go` file. lefthook skips a job
+whose file list is empty, and it leaves deleted files out of that list, so a
+commit whose only Go change is a deletion (or a rename to a name without `.go`)
+is linted by a second job, `lint-go-deletions`. It runs for every commit and
+returns at once when there is nothing for it to lint.
+
 Limits:
 - git-ignored `*.tfvars` are not read: the check sees what the commit records.
+- A file that has unstaged changes, is missing from your working tree, or that
+  git is told not to look at (skip-worktree, as outside a sparse checkout, or
+  assume-unchanged) is checked as git stores it: an LFS file as its pointer, a
+  git-crypt file encrypted. A check that reads such a git-crypt file fails:
+  stage or stash its changes.
 - `go` comes from your project's toolchain on `PATH`.
 - If lefthook did not set the unstaged hunks of a partially staged file aside,
   that file's working-tree version is what gets checked. That happens with
@@ -230,18 +323,18 @@ Limits:
 
 ## Available hooks
 
-| Lane       | Hooks                                                     |
-| ---------- | -------------------------------------------------------- |
-| `go`       | `format-go`, `lint-go`                                    |
-| `lua`      | `format-lua`                                              |
-| `nix`      | `format-nix`, `lint-nix`                                  |
-| `opentofu` | `format-opentofu`, `lint-opentofu`, `security-opentofu`  |
-| `rust`     | `format-rust`                                             |
-| `shell`    | `format-shell` (shfmt), `lint-shell`                      |
-| `toml`     | `format-toml`                                             |
-| `yaml`     | `format-yaml`                                             |
-| `zig`      | `format-zig`                                              |
-| —          | `security-gitleaks` (repo-wide), `auto-commit` (finalize) |
+| Lane       | Hooks                                                                               |
+| ---------- | ----------------------------------------------------------------------------------- |
+| `go`       | `format-go`, `lint-go`                                                              |
+| `lua`      | `format-lua`                                                                        |
+| `nix`      | `format-nix`, `lint-nix`                                                            |
+| `opentofu` | `format-opentofu`, `lint-opentofu`, `security-opentofu`                             |
+| `rust`     | `format-rust`                                                                       |
+| `shell`    | `format-shell` (shfmt), `lint-shell`                                                |
+| `toml`     | `format-toml`                                                                       |
+| `yaml`     | `format-yaml`                                                                       |
+| `zig`      | `format-zig`                                                                        |
+| —          | `pathspec-guard` (guard), `security-gitleaks` (repo-wide), `auto-commit` (finalize) |
 
 ## Overrides & escape hatches
 
@@ -250,7 +343,8 @@ Limits:
   nested jobs) — the practical way to get a single commit with your own
   message. It matches **job** names, not the hook names in the table above:
   the `format-shell` hook contributes a job named `shfmt`, so excluding it
-  takes `LEFTHOOK_EXCLUDE=shfmt`, not `LEFTHOOK_EXCLUDE=format-shell`.
+  takes `LEFTHOOK_EXCLUDE=shfmt`, not `LEFTHOOK_EXCLUDE=format-shell`; and
+  `lint-go` contributes two, `lint-go` and `lint-go-deletions`.
 - `git commit --amend --no-verify` is the way to amend, and the same goes for
   `git commit --fixup=<sha>`: a pre-commit hook cannot detect either (the
   environment is byte-identical to a normal commit), so without `--no-verify`
@@ -277,11 +371,9 @@ Two caveats:
 
 - `lefthook run pre-commit` is not a dry run — the `auto-commit` job creates
   real commits from whatever is staged.
-- If an unstaged edit touches the same line a formatter rewrites, lefthook's
-  restore of unstaged changes can fail: the commit succeeds and the unstaged
-  edit disappears from the worktree, with only a console warning. The content
-  survives in the `lefthook auto backup` stash and
-  `.git/info/lefthook-unstaged.patch`.
+- If an unstaged edit touches a line a formatter rewrites, lefthook may not
+  put your unstaged edits back: see
+  [Unstaged edits that a formatter's fix collides with](#unstaged-edits-that-a-formatters-fix-collides-with).
 
 ## auto-commit
 
@@ -311,24 +403,31 @@ Consequences worth knowing:
   the working tree instead, so a formatter's fix lands in its own commit even
   on lefthook ≥ 2.1.7, which stages fixes only after this job; the index is
   then brought up to the committed blob. A file the formatter puts back exactly
-  as `HEAD` has it gets no (empty) commit.
+  as `HEAD` has it gets no (empty) commit. Some files always keep their staged
+  blob, because their working-tree copy may hold edits you never staged, or
+  not be the repository's file at all: those git does not compare with the
+  index (marked `--assume-unchanged` or `--skip-worktree`, or any file under
+  `core.ignoreStat`), and any file below a symlinked directory.
 - Other git activity meanwhile (a `git status` in another terminal, an
   editor's git integration, another terminal unstaging files) cannot break
   it: the real index is written once, after the commits are public, and never
-  over a newer staging made in the meantime.
+  over a newer staging made in the meantime. For that write it holds
+  `.git/index.lock` from reading the index to replacing it, so a `git add` or
+  `git commit` in another terminal at that instant fails with git's
+  "index.lock exists" message: run it again.
 - `commit.gpgSign` is honoured: every per-file commit is signed. The
   per-file commits run no `prepare-commit-msg` or `post-commit` hook.
 - Situations where splitting would be wrong pass through untouched as one
   normal commit: concluding a merge, squash-merge, cherry-pick, revert, or
   rebase; `git commit -a` / pathspec commits (git runs those against a
-  temporary index); a staged filename containing a tab, newline, quote or
-  backslash, which cannot be split safely; and a repository with a
+  temporary index); a staged filename containing a tab, newline, double
+  quote or backslash, which cannot be split safely; and a repository with a
   `commit-msg` or `prepare-commit-msg` hook installed (including one under
   `core.hooksPath`), whose checks the generated messages would bypass.
-- A staged filename starting with `:` blocks the commit, with the names
-  listed: lefthook hands file names to git as pathspecs, where a leading `:`
-  means pathspec magic, so git would act on some other file. Rename it, or
-  commit with `--no-verify`.
+  lefthook's own script for one of those counts only when your lefthook
+  config has jobs for it: lefthook 1.13.0 to 2.0.15 install one for
+  `prepare-commit-msg` on every `lefthook install`, jobs or not, and it stays
+  after an upgrade.
 - `--amend` and `--fixup` are **not** among the pass-throughs — they are
   indistinguishable from a normal commit at hook time. Use `--no-verify` (see
   above).
@@ -397,10 +496,22 @@ formatter would change fails `nix flake check`:
 checks.lefthook-hooks = lefthookShell.mkHooksCheck self;
 ```
 
+It loads your repository's own lefthook config, as your commits do, so its
+`exclude`s and its own jobs count; only a repository with no config at all
+gets a stub that extends the generated file. A job of yours runs in the build
+sandbox too, with no network and only the hooks' tools on `PATH`. To leave one
+out, add its name to the check's `LEFTHOOK_EXCLUDE`:
+`(lefthookShell.mkHooksCheck self).overrideAttrs (o: { LEFTHOOK_EXCLUDE = o.LEFTHOOK_EXCLUDE + ",my-job"; })`.
+If your `.yamlfmt` formats differently from yamlfmt's defaults, add
+`lefthook-generated.yml` to its `exclude:` list. The file is rendered in the
+defaults, and the yaml lane would otherwise rewrite it, failing this check and
+the drift check.
+
 The build sandbox has no network and no project toolchain, so that check
 leaves out `lint-go`, `lint-opentofu` and `security-opentofu` (Go modules,
-tflint plugins, trivy's checks bundle) and `auto-commit`; everything else runs,
-and `security-gitleaks` scans the whole tree. For the full set, run the hooks
+tflint plugins, trivy's checks bundle). It leaves out `auto-commit` and
+`pathspec-guard` too: it commits nothing. Everything else runs, and
+`security-gitleaks` scans the whole tree. For the full set, run the hooks
 in CI from the dev shell, on a checkout of the commit under test:
 
 ```sh
@@ -467,9 +578,9 @@ way.
 
 ## Adding a hook
 
-Add an entry to `hooks.nix`: exactly one of `lane` + `order`, `standalone`, or
-`finalize` (validated at evaluation), the `tools` it needs on `PATH`, and one
-or more `jobs` written as verbatim lefthook job attrsets whose `run` calls the
-tool by bare name. Formatters set `stage_fixed = true`. That is the only file
-to touch — `mk-shell.nix` renders it and the module exposes the
-`<name>.enable` option automatically.
+Add an entry to `hooks.nix`: exactly one of `lane` + `order`, `standalone`,
+`guard` or `finalize` (validated at evaluation), the `tools` it needs on
+`PATH`, and one or more `jobs` written as verbatim lefthook job attrsets whose
+`run` calls the tool by bare name. Formatters set `stage_fixed = true`, which
+also turns `pathspec-guard` on. That is the only file to touch — `mk-shell.nix`
+renders it and the module exposes the `<name>.enable` option automatically.
