@@ -10,8 +10,8 @@
 #   - those it calls through a local `source` path. They stay in the scan, so
 #     a risky value the directory passes into a module is still evaluated;
 #   - other root modules, untouched by the commit. Their files are skipped one
-#     directory at a time (--skip-files <subdir>/*.tf), or a staged .tf at the
-#     repository root would fail the commit over every one of them.
+#     directory at a time (--skip-files <dir>/<subdir>/*.tf), or a staged .tf
+#     at the repository root would fail the commit over every one of them.
 # (`--skip-dirs '*/*'` used to skip every subdirectory, called modules
 # included: those calls failed to load, the log saying so was silenced, and
 # nothing passed into a module was ever checked.) --misconfig-scanners
@@ -77,7 +77,11 @@ done | sort -u | while IFS= read -r dir; do
 
   # Every other directory below DIR that holds .tf files is a root module of
   # its own: skip its files (not its subdirectories, which may hold modules
-  # DIR calls).
+  # DIR calls). Named from the current directory, not from DIR: trivy resolves
+  # a relative --skip-files against the current directory first, and reads it
+  # as relative to DIR only when that leads outside DIR. Named from DIR, a root
+  # module at infra/infra made infra/*.tf, which trivy took for DIR's own
+  # files: they went unscanned.
   set --
   (cd -- "$dir" && find . -name .terraform -prune -o \( -name '*.tf' -o -name '*.tofu' -o -name '*.tf.json' \) -print) |
     sed 's|/[^/]*$||' | sort -u >"$staged_scratch/tfdirs"
@@ -85,7 +89,7 @@ done | sort -u | while IFS= read -r dir; do
     [ "$so_d" != . ] || continue
     so_abs=$(cd -- "$dir/$so_d" && pwd -P)
     if ! grep -Fx -e "$so_abs" "$staged_scratch/called" >/dev/null; then
-      so_d=${so_d#./}
+      so_d=$dir/${so_d#./}
       set -- "$@" --skip-files "$so_d/*.tf" --skip-files "$so_d/*.tofu" --skip-files "$so_d/*.tf.json"
     fi
   done <"$staged_scratch/tfdirs"
