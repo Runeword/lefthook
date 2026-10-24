@@ -18,7 +18,6 @@ set -u
 leftovers() { find .git -maxdepth 1 \( -name 'lefthook-split.*' -o -name lefthook-ac-predirty \) | wc -l; }
 nsplit() { find .git -maxdepth 1 -name 'lefthook-split.*' | wc -l; }
 staged() { git diff --cached --name-only | sort | tr '\n' ' '; }
-commits() { git rev-list --count HEAD 2>/dev/null || echo 0; }
 
 # End-to-end config: prepare, a stage_fixed formatter that strips trailing
 # blanks from *.txt (a stand-in for the shipped formatters), auto-commit.
@@ -35,12 +34,15 @@ cfg() {
 
 # The fold regime without lefthook, as lefthook >= 2.1.7 leaves it to the
 # finalize job (index = pre-format blob, worktree = formatted): prepare,
-# format, split. $1 is the wrapper to run (default: the real one).
+# format, split. $1 is the wrapper to split with (default: the real one). The
+# prepare pass always runs the real one, so that an instrumented `git ls-files`
+# (the index) or `git ls-tree` (HEAD) counts only the split's calls, which are
+# reconcile's reads: 1 is its first look, without the lock, and 2 its read
+# under the lock.
 fold_split() {
-  local ac=${1:-$AUTO_COMMIT}
-  "$ac" --prepare
+  "$AUTO_COMMIT" --prepare
   find . -path ./.git -prune -o -name '*.txt' -type f -exec sed -i 's/[[:space:]]*$//' {} +
-  "$ac" >"$R.out" 2>&1
+  "${1:-$AUTO_COMMIT}" >"$R.out" 2>&1
   echo $? >"$R.rc"
 }
 
@@ -172,13 +174,35 @@ echo "## B. the documented design"
   res "B2 stat data survives for a FOLDED entry (documented: it does not)" FAIL eval '! git ls-files --debug fold.txt | grep -q "mtime: 0:0"'
 )
 (
-  # Documented: an assume-unchanged bit on a staged path the fold rewrites is
-  # dropped along with the old entry.
-  newrepo b2e
-  printf 'p\n' >p.txt && printf 'q\n' >q.txt && git add -A && git commit -qm base
-  printf 'p2  \n' >p.txt && git add p.txt && git update-index --assume-unchanged p.txt
-  fold_split
-  res "B2e assume-unchanged bit on a staged, folded path survives (documented: it does not)" FAIL eval 'git ls-files -v p.txt | grep -q "^h "'
+  # A staged path git does not compare with its working-tree file may hold a
+  # local-only edit there that nobody staged, and that gitleaks never saw: it
+  # keeps its staged blob, and so its flag. (Round-11 review: these folded the
+  # working-tree file, edit included.) Under core.ignoreStat, staging the file
+  # is what sets its assume-unchanged bit.
+  for mode in assume-unchanged skip-worktree ignoreStat; do
+    newrepo b2e-$mode
+    printf 'p\n' >p.txt && printf 'q\n' >q.txt && git add -A && git commit -qm base
+    if [ "$mode" = ignoreStat ]; then git config core.ignoreStat true; fi
+    printf 'p2\n' >p.txt && git add p.txt
+    if [ "$mode" != ignoreStat ]; then git update-index --"$mode" p.txt; fi
+    flag=$(git ls-files -v p.txt | cut -c1)
+    printf 'p2\nLOCAL-ONLY\n' >p.txt
+    fold_split
+    res "B2e $mode ($flag): the staged blob is committed, not the local edit" PASS eq "$(git show HEAD:p.txt)" p2
+    res "B2e $mode ($flag): the flag survives" PASS eq "$(git ls-files -v p.txt | cut -c1)" "$flag"
+  done
+)
+(
+  # A path below a directory that became a symlink names whatever file the
+  # link leads to, inside the repository or not.
+  newrepo b2s
+  mkdir -p d "$T/b2s-outside" && printf 'f\n' >d/f.txt && printf 'OUTSIDE\n' >"$T/b2s-outside/f.txt"
+  git add -A && git commit -qm base
+  printf 'f2\n' >d/f.txt && git add d/f.txt
+  "$AUTO_COMMIT" --prepare
+  rm -r d && ln -s "$T/b2s-outside" d
+  "$AUTO_COMMIT" >"$R.out" 2>&1
+  res "B2s a path below a symlinked directory keeps its staged blob" PASS eq "$(git show HEAD:d/f.txt)" f2
 )
 (
   # Process budget: three git processes per path (update-index, write-tree,
@@ -303,8 +327,8 @@ echo "## C. other terminals acting mid-split (2026-10-11 candidates, round-11 fi
     printf 'n5\n' >n5.md && git add -A
     w=$(instrument "$AUTO_COMMIT" commit-tree 2 'git reset -q')
     if [ "$mode" = fold ]; then fold_split "$w"; else "$w" >"$R.out" 2>&1; fi
-    res "A1 git reset mid-split ($mode): all 5 commits land" PASS eq "$(commits)" 6
-    res "A1 git reset mid-split ($mode): index == HEAD, the next commit reverts nothing" PASS eval '[ "$(idx)" = "$(headtree)" ] && git diff --cached --quiet'
+    res "A1 git reset mid-split ($mode): all 5 commits land" PASS eval 'fired "$w" && [ "$(commits)" = 6 ]'
+    res "A1 git reset mid-split ($mode): index == HEAD, the next commit reverts nothing" PASS eval 'fired "$w" && [ "$(idx)" = "$(headtree)" ] && git diff --cached --quiet'
   done
 )
 (
@@ -315,7 +339,7 @@ echo "## C. other terminals acting mid-split (2026-10-11 candidates, round-11 fi
   git add -A
   w=$(instrument "$AUTO_COMMIT" commit-tree 1 'git restore --staged b.txt')
   "$w" >"$R.out" 2>&1
-  res "A1 git restore --staged of one path mid-split: index == HEAD afterwards" PASS eval '[ "$(commits)" = 4 ] && [ "$(idx)" = "$(headtree)" ]'
+  res "A1 git restore --staged of one path mid-split: index == HEAD afterwards" PASS eval 'fired "$w" && [ "$(commits)" = 4 ] && [ "$(idx)" = "$(headtree)" ]'
 )
 (
   # G11: a newer version of a folded path staged mid-split stays staged.
@@ -324,7 +348,7 @@ echo "## C. other terminals acting mid-split (2026-10-11 candidates, round-11 fi
   printf 'a  \n' >a.txt && printf 'b\n' >b.txt && git add -A
   w=$(instrument "$AUTO_COMMIT" commit-tree 1 'printf "a-newer\n" >a.txt && git add a.txt')
   fold_split "$w"
-  res "G11 newer staging of a folded path made mid-split survives" PASS eval '[ "$(git ls-files -s a.txt | cut -d" " -f2)" = "$(git hash-object a.txt)" ] && [ "$(git show HEAD:a.txt)" = a ]'
+  res "G11 newer staging of a folded path made mid-split survives" PASS eval 'fired "$w" && [ "$(git ls-files -s a.txt | cut -d" " -f2)" = "$(git hash-object a.txt)" ] && [ "$(git show HEAD:a.txt)" = a ]'
 )
 (
   # G6b: a MODIFIED path the user unstages mid-split (git rm --cached) stays
@@ -337,6 +361,51 @@ echo "## C. other terminals acting mid-split (2026-10-11 candidates, round-11 fi
   res "G6b git rm --cached of a modified path mid-split is kept" PASS eval '[ -z "$(git ls-files a.txt)" ] && [ "$(git ls-files -s b.txt | cut -d" " -f2)" = "$(git rev-parse HEAD:b.txt)" ]'
 )
 (
+  # Round-11 review: reconcile read the index without index.lock and wrote it
+  # later, so a git add or a commit landing in between was overwritten: the add
+  # undone, the commit reverted by the next one. Injected after each of its
+  # reads (see fold_split), the other terminal's work must survive, or be
+  # refused (the lock is held) so that it can retry, but never be overwritten.
+  for at in 1 2; do
+    newrepo lock-add-$at
+    printf 'k\n' >keep && git add -A && git commit -qm base
+    printf 'a  \n' >a.txt && printf 'b\n' >b.txt && git add -A
+    w=$(instrument "$AUTO_COMMIT" ls-files "$at" 'printf "a-newer\n" >a.txt; git add a.txt; echo $? >.git/other-rc')
+    fold_split "$w"
+    echo "   lock-add-$at: other git add exited $(cat .git/other-rc 2>/dev/null || echo -)"
+    res "L$at git add as reconcile reads the index: refused or kept, never overwritten" PASS eval 'fired "$w" && { [ "$(cat .git/other-rc)" != 0 ] || [ "$(git ls-files -s a.txt | cut -d" " -f2)" = "$(git hash-object a.txt)" ]; }'
+    res "L$at git add as reconcile reads the index: index.lock released" PASS eval '[ ! -e .git/index.lock ]'
+
+    newrepo lock-commit-$at
+    printf 'k\n' >keep && git add -A && git commit -qm base
+    printf 'a  \n' >a.txt && printf 'b\n' >b.txt && git add -A
+    w=$(instrument "$AUTO_COMMIT" ls-tree "$at" 'printf "a-newer\n" >a.txt && git add a.txt && git commit -qm other')
+    fold_split "$w"
+    res "L$at commit as reconcile reads the index: the next commit reverts nothing" PASS eval 'fired "$w" && git diff --cached --quiet'
+  done
+)
+(
+  # index.lock held for a moment as reconcile starts: it waits its turn.
+  newrepo lock-wait
+  printf 'k\n' >keep && git add -A && git commit -qm base
+  printf 'a  \n' >a.txt && git add -A
+  w=$(instrument "$AUTO_COMMIT" ls-files 1 ': >.git/index.lock; (sleep 0.5; rm -f .git/index.lock) &')
+  fold_split "$w"
+  res "L3 index.lock held for 0.5 s: reconcile waits, then brings the index up to date" PASS eval 'fired "$w" && [ "$(idx)" = "$(headtree)" ] && [ ! -e .git/index.lock ]'
+)
+(
+  # index.lock held throughout: the commits are public, so reconcile names
+  # what to git add, and leaves the other process's lock alone.
+  newrepo lock-held
+  printf 'k\n' >keep && git add -A && git commit -qm base
+  printf 'a  \n' >a.txt && git add -A
+  w=$(instrument "$AUTO_COMMIT" ls-files 1 ': >.git/index.lock')
+  fold_split "$w"
+  held=$([ -e .git/index.lock ] && echo yes)
+  rm -f .git/index.lock
+  res "L4 index.lock held throughout: committed, a.txt named to git add, the lock left alone" PASS eval '[ "$(git show HEAD:a.txt)" = a ] && grep -q "^  a.txt$" "$R.out" && [ "$held" = yes ]'
+)
+(
   # Documented ambiguity: unstaging a NEW path mid-split stages exactly its
   # base state (absent), which is what a reset looks like; the split re-stages
   # what it committed so the index matches HEAD.
@@ -345,7 +414,7 @@ echo "## C. other terminals acting mid-split (2026-10-11 candidates, round-11 fi
   printf 'a  \n' >a.txt && printf 'b  \n' >b.txt && git add -A
   w=$(instrument "$AUTO_COMMIT" commit-tree 1 'git rm -qf --cached a.txt')
   fold_split "$w"
-  res "G6 unstaging a new path mid-split: re-staged to match HEAD (documented)" PASS eval '[ "$(git ls-files -s a.txt | cut -d" " -f2)" = "$(git rev-parse HEAD:a.txt)" ]'
+  res "G6 unstaging a new path mid-split: re-staged to match HEAD (documented)" PASS eval 'fired "$w" && [ "$(git ls-files -s a.txt | cut -d" " -f2)" = "$(git rev-parse HEAD:a.txt)" ]'
 )
 
 echo "## D. publishing, signing, hooks, guards, scale"
@@ -428,7 +497,10 @@ EOF
   res "D5 a commit-msg hook under core.hooksPath is found too" PASS eval '[ "$rc" = 0 ] && [ "$(commits)" = 2 ] && grep -q "commit-msg hook is installed" "$R.out"'
 )
 (
-  # Pathspec magic: lefthook would hand ":name" to git add/checkout.
+  # pathspec-guard (tests/pathspec-guard.sh) refuses staged names lefthook
+  # would hand to git as patterns reaching other files. A config rendered
+  # before that job existed, like cfg's, starts with auto-commit-prepare,
+  # which calls it too.
   newrepo d6 && cfg
   printf 'k\n' >keep && git add -A && LEFTHOOK=0 git commit -qm base
   printf 'c\n' >:colon.txt && printf 'n\n' >normal.txt && git add -A
@@ -437,6 +509,63 @@ EOF
   res "D6 --prepare refuses a staged path starting with ':' and names it" PASS eval '[ "$rc" = 1 ] && grep -q ":colon.txt" "$R.out"'
   git commit -qm umbrella >"$R.out" 2>&1
   res "D6 the commit is blocked before anything runs" PASS eval '[ "$(commits)" = 1 ] && [ "$(git diff --cached --name-only | wc -l)" = 2 ]'
+)
+(
+  # Glob characters. After the formatter, lefthook hands the staged names to
+  # `git add --force`, which stages every file a name matches as a pattern,
+  # ignored ones included, and the split commits them. A name that matches
+  # nothing but itself goes through. (Round-11 review; 2026-10-21 panel.)
+  newrepo d9 && cfg
+  printf 'k\n' >keep && git add -A && LEFTHOOK=0 git commit -qm base
+  mkdir -p 'app/[id]' && printf 'p  \n' >'app/[id]/page.txt' && git add -A
+  git commit -qm umbrella >"$R.out" 2>&1
+  res "D9 a route file like app/[id]/page.txt is split and formatted like any other" PASS eval '[ "$(git log -1 --format=%s)" = "Add app/[id]/page.txt" ] && [ "$(git show "HEAD:app/[id]/page.txt")" = p ]'
+  n=$(commits)
+  printf 'gsecret.txt\n' >>.git/info/exclude
+  printf 'SECRET\n' >gsecret.txt
+  printf 'g  \n' >'g*.txt' && git add -A
+  git commit -qm umbrella >"$R.out" 2>&1
+  res "D9 g*.txt staged next to an ignored gsecret.txt: blocked, naming it, and gsecret.txt neither staged nor committed" PASS eval '[ "$(commits)" = "$n" ] && grep -q "also matches .gsecret.txt." "$R.out" && [ -z "$(git ls-files gsecret.txt)" ]'
+  # Without the prepare pass (a config committed before it existed), the
+  # split itself still takes the name literally.
+  "$AUTO_COMMIT" >"$R.out" 2>&1
+  res "D9 the split alone commits g*.txt by its literal name" PASS eval '[ "$(commits)" = $((n + 1)) ] && [ "$(git log -1 --format=%s)" = "Add g*.txt" ] && [ -z "$(git ls-files gsecret.txt)" ]'
+)
+(
+  # lefthook 1.13.0 to 2.0.15 install their prepare-commit-msg script on every
+  # lefthook install, configured or not, to keep the hooks in sync (later ones
+  # when the config has no hooks at all), and nothing removes it. It runs
+  # nothing, yet it turned splitting off for good. (Round-11 review.)
+  newrepo d8
+  printf 'no_auto_install: true\n' >lefthook.yml # no hooks yet: lefthook installs its script
+  printf 'lefthook-local.yml\n' >>.git/info/exclude
+  lefthook install >/dev/null 2>&1
+  cfg
+  res "D8 (setup) lefthook left its prepare-commit-msg script installed" PASS eval '[ -x .git/hooks/prepare-commit-msg ] && grep -q "^call_lefthook run \"prepare-commit-msg\"" .git/hooks/prepare-commit-msg'
+  printf 'k\n' >keep && git add -A && LEFTHOOK=0 git commit -qm base
+  printf 'a\n' >a.txt && printf 'b\n' >b.txt && git add -A
+  git commit -qm umbrella >"$R.out" 2>&1
+  res "D8 lefthook's prepare-commit-msg script with nothing configured: the commit is split" PASS eval '[ "$(commits)" = 3 ] && ! grep -q "hook is installed" "$R.out"'
+  # Jobs for it in the config, here in lefthook-local.yml, make it a message hook.
+  printf 'prepare-commit-msg:\n  jobs:\n    - run: echo prepared\n' >lefthook-local.yml
+  printf 'c\n' >c.txt && git add -A
+  n=$(commits)
+  git commit -qm "one commit" >"$R.out" 2>&1
+  rc=$?
+  rm lefthook-local.yml
+  res "D8 the same script with prepare-commit-msg jobs configured: one commit" PASS eval '[ "$rc" = 0 ] && [ "$(commits)" = $((n + 1)) ] && [ "$(git log -1 --format=%s)" = "one commit" ]'
+  # The script's last line before lefthook 1.5.
+  sed -i 's/^call_lefthook run "prepare-commit-msg" "\$@"$/call_lefthook "run prepare-commit-msg $@"/' .git/hooks/prepare-commit-msg
+  printf 'd\n' >d.txt && git add -A
+  "$AUTO_COMMIT" >"$R.out" 2>&1
+  res "D8 ... and in the form lefthook wrote before 1.5" PASS eq "$(git log -1 --format=%s)" "Add d.txt"
+  # A config lefthook cannot read gives no answer: the commit stays whole.
+  printf 'pre-commit: [\n' >lefthook.yml
+  printf 'e\n' >e.txt && git add -A
+  n=$(commits)
+  "$AUTO_COMMIT" >"$R.out" 2>&1
+  rc=$?
+  res "D8 when lefthook dump fails, the script counts as a message hook" PASS eval '[ "$rc" = 0 ] && [ "$(commits)" = "$n" ] && grep -q "a prepare-commit-msg hook is installed" "$R.out"'
 )
 (
   newrepo d7
@@ -450,4 +579,4 @@ EOF
   res "D7 1000 adds: 1000 commits, index == HEAD" PASS eval '[ "$(commits)" = 1001 ] && [ "$(idx)" = "$(headtree)" ]'
 )
 
-summary
+summary 86
