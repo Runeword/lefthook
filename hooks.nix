@@ -4,11 +4,16 @@
 #   lane       language lane it belongs to. Lanes run in parallel; jobs within
 #              a lane are piped in `order` (format = 0 -> lint = 1 -> security = 2).
 #   standalone repo-wide job with no lane (e.g. gitleaks), run under `main`.
+#   guard      runs before everything else (pathspec-guard). On by default
+#              wherever another enabled hook has a job with `stage_fixed`: what
+#              it guards is lefthook's staging of a formatter's fix.
 #   finalize   runs after `main` succeeds (auto-commit).
 #   tools      packages placed on the dev-shell PATH. `run` commands call them
 #              by bare name, so the generated config is machine-independent and
-#              meant to be committed; a commit made outside the dev shell fails
-#              loudly (command not found) instead of running stale tools.
+#              meant to be committed. Outside the dev shell the names resolve
+#              from whatever PATH holds: command not found where nothing
+#              provides them, a global install's tools, at its own revision,
+#              where one does.
 #   jobs       one or more verbatim lefthook job attrsets (name, run, glob,
 #              stage_fixed, skip, ...), rendered into the config as-is.
 #
@@ -40,6 +45,14 @@ in
     ];
   };
 
+  # lefthook leaves a deleted file out of {staged_files} and skips a job left
+  # with none, so the first job does not run for a commit whose only Go change
+  # is a deletion. The second has no file template and no glob, so lefthook
+  # runs it for every commit: it lints the packages that lost a .go file when
+  # no .go file is added or modified, and otherwise exits at once, the first
+  # job linting those packages too. No glob, because lefthook lists a renamed
+  # file by its new name only: x.go renamed to x.go.orig matched none.
+  # tests/staged-tree.sh commits through this exact render.
   lint-go = {
     lane = "go";
     order = 1;
@@ -52,6 +65,10 @@ in
         name = "lint-go";
         glob = "*.go";
         run = "lint-go {staged_files}";
+      }
+      {
+        name = "lint-go-deletions";
+        run = "lint-go --deletions";
       }
     ];
   };
@@ -241,6 +258,24 @@ in
     ];
   };
 
+  # lefthook hands the staged names to git as patterns (pathspecs) when it
+  # stages a formatter's fix: staging g*.txt also committed an ignored
+  # gsecret.txt. This refuses such names before any formatter runs. No skip for
+  # merges and rebases, where the formatters run too. It also keeps a copy of
+  # lefthook's backup of the unstaged changes, which lefthook deletes, in
+  # refs/lefthook/backup. scripts/pathspec-guard.sh says what it refuses and
+  # why.
+  pathspec-guard = {
+    guard = true;
+    tools = [ wrappers.pathspec-guard ];
+    jobs = [
+      {
+        name = "pathspec-guard";
+        run = "pathspec-guard";
+      }
+    ];
+  };
+
   # A wrapper, not a pipeline in `run`: lefthook executes `run` through `sh -c`
   # with pipefail OFF, so `git diff … | gitleaks stdin` reported only gitleaks'
   # status and PASSED whenever the diff command failed. The wrapper also forces
@@ -265,13 +300,14 @@ in
     # exporting GIT_CONFIG_GLOBAL for identity), breaking `git commit` from the
     # shell. The script bakes in its own git via runtimeInputs.
     tools = [ wrappers.auto-commit ];
-    # A second job the renderer places at the HEAD of the piped pre-commit, so it
-    # runs before any formatter. It snapshots which staged files already carry
-    # unstaged changes; the finalize job below reads that to fold an in-hook
-    # reformat into the split commits while preserving partial staging. Needed
-    # because lefthook >= 2.1.7 defers `stage_fixed` to after finalize jobs, so
-    # the index the finalize job sees would otherwise still hold the pre-format
-    # blob. See scripts/auto-commit.sh.
+    # A second job the renderer places ahead of `main`, right after the guards,
+    # so it runs before any formatter. It snapshots which staged files' working
+    # copies may already differ from the staged ones (unstaged changes, or a
+    # file git does not compare); the finalize job below reads that to fold an
+    # in-hook reformat into the split commits while preserving partial
+    # staging. Needed because lefthook >= 2.1.7 defers `stage_fixed` to after
+    # finalize jobs, so the index the finalize job sees would otherwise still
+    # hold the pre-format blob. See scripts/auto-commit.sh.
     prepareJobs = [
       {
         name = "auto-commit-prepare";
