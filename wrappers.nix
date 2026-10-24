@@ -39,21 +39,40 @@ let
     pkgs.gawk
     pkgs.git
   ];
+
+  # Refuses staged names that lefthook would hand to git as patterns reaching
+  # other files. The render's first job wherever a formatter stages its fix,
+  # and called by auto-commit's "--prepare" pass. awk runs every git command
+  # through a pipe, so it needs nothing else.
+  pathspecGuard = pkgs.writeShellApplication {
+    name = "pathspec-guard";
+    runtimeInputs = [
+      pkgs.gawk
+      pkgs.git
+    ];
+    text = builtins.readFile ./scripts/pathspec-guard.sh;
+  };
 in
 {
+  pathspec-guard = pathspecGuard;
   auto-commit = pkgs.writeShellApplication {
     name = "auto-commit";
     # Not just git: awk to plan the commits (the deletions-before-additions
     # reorder, which paths fold in a formatter's fix) and to reconcile the index
-    # after publishing, sed for the "--prepare" pathspec guard and messages,
-    # coreutils' mktemp/cp/rm/sleep for the private index and its lock retry,
-    # and find to sweep the private indexes of killed splits.
+    # after publishing, sed for the "--prepare" list of paths git does not
+    # compare and for messages, coreutils' mktemp/cp/rm/sleep for the private
+    # index and its lock retry, find to sweep the private indexes of killed
+    # splits, pathspec-guard, which the "--prepare" pass runs too, for configs
+    # rendered without that job, and lefthook to read the merged config
+    # (`lefthook dump`) when a message hook is lefthook's own script.
     runtimeInputs = [
+      pathspecGuard
       pkgs.coreutils
       pkgs.findutils
       pkgs.gawk
       pkgs.git
       pkgs.gnused
+      pkgs.lefthook
     ];
     text = builtins.readFile ./scripts/auto-commit.sh;
   };
