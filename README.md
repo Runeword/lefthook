@@ -215,7 +215,9 @@ partially staged files, a step that already reads their names as patterns.
 With auto-commit on, `auto-commit-prepare` runs the same check, for configs
 rendered from 2026-08-15, when that job appeared, until `pathspec-guard`
 existed. A config rendered before that has neither job, and gets the check
-once you regenerate it. A commit made with `git --literal-pathspecs` (magit's
+once you regenerate it. A current render leaves the check to `pathspec-guard`
+alone, so `hooks.pathspec-guard.enable = false` turns it off with auto-commit
+on too. A commit made with `git --literal-pathspecs` (magit's
 default) has git read every name as itself, so a pattern goes through then.
 
 `pathspec-guard` also keeps a copy of lefthook's backup of your unstaged
@@ -305,7 +307,8 @@ call, the commit fails (run `tofu init`) instead of the module going unscanned.
 whose file list is empty, and it leaves deleted files out of that list, so a
 commit whose only Go change is a deletion (or a rename to a name without `.go`)
 is linted by a second job, `lint-go-deletions`. It runs for every commit and
-returns at once when there is nothing for it to lint.
+returns at once when there is nothing left for it to lint: no `.go` file was
+deleted, or `lint-go` has already linted those packages for what is staged.
 
 Limits:
 - git-ignored `*.tfvars` are not read: the check sees what the commit records.
