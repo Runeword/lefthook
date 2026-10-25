@@ -33,6 +33,7 @@ nix build -L .#checks.x86_64-linux.behaviour-auto-commit   # tests/auto-commit.s
 nix build -L .#checks.x86_64-linux.behaviour-pathspec-guard   # tests/pathspec-guard.sh
 nix build -L .#checks.x86_64-linux.behaviour-staged-tree   # tests/staged-tree.sh
 nix build -L .#checks.x86_64-linux.behaviour-security-gitleaks   # tests/security-gitleaks.sh
+nix build -L .#checks.x86_64-linux.behaviour-wire-repo   # tests/wire-repo.sh
 nix build -L .#checks.x86_64-linux.lefthook-hooks-own-config   # tests/hooks-check.nix
 nix build .#devShells.x86_64-linux.default.lefthookConfig  # render the config
 nix develop                                        # installs hooks; creates lefthook-generated.yml only if MISSING, else warns on drift
@@ -113,7 +114,11 @@ hooks.nix  ──►  mk-shell.nix  ──►  lefthook-generated.yml (committed
   generated config is never rewritten on entry, only created when missing —
   drift gets a warning naming `lefthook-regen` (the same script in write mode,
   on the shell `PATH`). `lefthook-init` and `lefthook-regen` use write mode.
-  Whatever it writes it names ("wrote … commit it"), in either mode.
+  Whatever it writes it names ("wrote … commit it"), in either mode. It seeds
+  `lefthook.yml` only where the repository has no main config under any name
+  lefthook loads, and warns when the one it has does not extend the generated
+  file. `lefthook-init` reads that same config to say whether the generated
+  hooks are active.
 - **`mk-shell.nix`** — an `evalModules` module plus the renderer. Exposes
   `mkShell` (dev shell), `toolchain` (the packages, for global installs) and
   `toolchainEnv` (the same packages as one `buildEnv`, for `nix profile
@@ -261,12 +266,17 @@ so a guard's default never depends on itself.
       copies idle for more than 60 minutes whose lock `flock -n` can take.
     - Both also delete the copy's `index.lock`, which a git killed mid-write
       leaves behind; without that, every later run exited 128.
+    - The copy's directories are made writable: `staged_copy_in` creates them
+      before its cp batch. `cp --parents` gives a directory it creates the
+      source's mode once the first file is in, so a read-only directory of the
+      worktree took one file and refused the next, tracked files and lint-go's
+      carry alike: the check failed. One that exists it leaves alone, given no
+      `--preserve=mode`, with which cp means to give it the source's mode too.
     - Every removal goes through `_st_reclaim`, which makes the copy writable
-      when a plain `rm -rf` fails. cp keeps a directory's mode, so a read-only
-      directory of the worktree is read-only in the copy too. A copy holding
-      one failed the exit trap, and with it a check that had passed, and then
-      failed the reclaim of every later run. The exit trap never fails the
-      check.
+      when a plain `rm -rf` fails: `staged_carry` copies a directory whole,
+      modes included. A copy holding a read-only directory failed the exit
+      trap, and with it a check that had passed, and then failed the reclaim
+      of every later run. The exit trap never fails the check.
     - Never replace the lock with mkdir: a SIGKILL would leave it held forever.
   - **Worktree form where the worktree is clean, the staged blob where it is
     not.** One cp batch and one checkout-index, never a process per file.
@@ -322,10 +332,15 @@ so a guard's default never depends on itself.
       deletions included, matches its glob. It has no glob: lefthook lists a
       renamed file by its new name only, so `x.go` renamed to `x.go.orig`
       matched none. It runs for every commit, so with nothing to lint it
-      exits before needing `go`, and it exits at once when a .go file is
-      added or modified (`:(top,icase)*.go`, as lefthook's glob matches),
-      since the first job then lints the deleted files' packages too.
-      `tests/staged-tree.sh` commits through the real render
+      exits before needing `go`. It also exits when the first job has linted
+      the deleted files' packages. Run from the top, that job lints them as
+      well. Once they pass, it writes HEAD and the staged entries
+      (`git ls-files -s`), hashed, to `<git dir>/lefthook-lint-go-deletions`,
+      and the second job skips while they match. A record, not a guess: it
+      used to skip whenever a .go file was added or modified, taking that for
+      a sign the first job would run. lefthook also leaves that job's files
+      out for `exclude:` or a staged file the worktree lacks, and the deletion
+      went unlinted. `tests/staged-tree.sh` commits through the real render
       (`LINT_GO_CONFIG`).
     - It carries in the git-ignored files that `go list -deps -test` reports,
       `//go:embed` targets (the `*EmbedFiles` fields) included. It skips
@@ -509,8 +524,12 @@ so a guard's default never depends on itself.
     auto-commit's `runtimeInputs`), because a config rendered from 2026-08-15
     (1ea6ac8 added that pass) until the guard job existed starts with it. A
     config older than that has neither, and no guard until it is
-    regenerated. In a current render the check runs twice; it costs a
-    `git diff --cached` and an awk, and the backup below is copied once.
+    regenerated.
+  - The render passes `--no-guard` to that pass, which leaves the check to
+    the guard job alone: it runs once, and `hooks.pathspec-guard.enable =
+    false` turns it off with auto-commit on too. A config rendered before the
+    flag ran it twice (a `git diff --cached` and an awk; the backup below was
+    copied once) and kept it on regardless.
   - `mkHooksCheck` excludes it: everything is staged there and nothing is
     committed, so a name it refuses would only fail the check.
 
@@ -549,8 +568,10 @@ so a guard's default never depends on itself.
     file's local edit.
   - The real fix is upstream: literal pathspecs and `-z` name lists.
     `tests/pathspec-guard.sh` commits through a formatter's render
-    (`GUARD_CONFIG`), without auto-commit and during a merge, and through
-    `PREPARE_ONLY_CONFIG`, auto-commit's render with no guard job.
+    (`GUARD_CONFIG`), without auto-commit and during a merge; through
+    `GUARD_OFF_CONFIG`, auto-commit's with the guard turned off; and through
+    `PREPARE_ONLY_CONFIG`, that render as configs from before the guard job
+    start (no guard job, no `--no-guard`).
 
 ## Nix gotchas seen in this repo
 
