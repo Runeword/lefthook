@@ -118,16 +118,21 @@ while [ "$remaining_patterns" != "" ]; do
   printf '%s\n' "$pattern" >>"$exclude"
 done
 
+# extends_generated CONFIG: whether CONFIG names lefthook-generated.yml (not the
+# .lefthook-generated.yml of old) outside a comment. Comments stripped first: a
+# commented-out `- lefthook-generated.yml` line, or a passing mention, used to
+# suppress the warnings below in exactly the case they exist for.
+extends_generated() {
+  sed 's/#.*//' "$1" 2>/dev/null | grep -E '(^|[^.])lefthook-generated\.yml' >/dev/null 2>&1
+}
+
 # Seed a root config only if the repository doesn't have one; warn when an
 # existing one silently ignores the generated file. Three cases, because `-e` is
 # false for a dangling symlink while `-L` is true: a real config, a dangling
 # link (which must be unlinked — `>` through it would write outside the repo,
 # and lefthook would otherwise create its own config there), or nothing.
 if [ -e lefthook.yml ]; then
-  # Comments stripped first: a commented-out `- lefthook-generated.yml` line, or
-  # a passing mention, used to suppress this warning in exactly the case it
-  # exists for.
-  if ! sed 's/#.*//' lefthook.yml | grep -E '(^|[^.])lefthook-generated\.yml' >/dev/null 2>&1; then
+  if ! extends_generated lefthook.yml; then
     echo "lefthook: warning: lefthook.yml does not extend lefthook-generated.yml; generated hooks are inactive" >&2
   fi
 else
@@ -156,10 +161,14 @@ else
   done
 
   if [ "$rival" != "" ]; then
-    echo "lefthook: warning: this repository already has $rival, which lefthook loads." >&2
-    echo "lefthook: warning: not creating a lefthook.yml, which would shadow it. Add" >&2
-    echo "lefthook: warning: 'lefthook-generated.yml' to that file's extends: list to activate" >&2
-    echo "lefthook: warning: the generated hooks." >&2
+    # Only when it does not extend the generated file yet: printed regardless,
+    # the warning asked repositories that had done so to do it.
+    if ! extends_generated "$rival"; then
+      echo "lefthook: warning: this repository already has $rival, which lefthook loads." >&2
+      echo "lefthook: warning: not creating a lefthook.yml, which would shadow it. Add" >&2
+      echo "lefthook: warning: 'lefthook-generated.yml' to that file's extends: list to activate" >&2
+      echo "lefthook: warning: the generated hooks." >&2
+    fi
   else
     if [ -L lefthook.yml ]; then
       echo "lefthook: warning: lefthook.yml was a dangling symlink; replacing it with a real config" >&2
