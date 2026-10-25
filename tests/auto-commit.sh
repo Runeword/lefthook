@@ -395,7 +395,7 @@ echo "## C. other terminals acting mid-split (2026-10-11 candidates, round-11 fi
 )
 (
   # index.lock held throughout: the commits are public, so reconcile names
-  # what to git add, and leaves the other process's lock alone.
+  # what to bring up to date, and leaves the other process's lock alone.
   newrepo lock-held
   printf 'k\n' >keep && git add -A && git commit -qm base
   printf 'a  \n' >a.txt && git add -A
@@ -403,7 +403,19 @@ echo "## C. other terminals acting mid-split (2026-10-11 candidates, round-11 fi
   fold_split "$w"
   held=$([ -e .git/index.lock ] && echo yes)
   rm -f .git/index.lock
-  res "L4 index.lock held throughout: committed, a.txt named to git add, the lock left alone" PASS eval '[ "$(git show HEAD:a.txt)" = a ] && grep -q "^  a.txt$" "$R.out" && [ "$held" = yes ]'
+  res "L4 index.lock held throughout: committed, a.txt named to bring up to date, the lock left alone" PASS eval '[ "$(git show HEAD:a.txt)" = a ] && grep -q "^  a.txt$" "$R.out" && [ "$held" = yes ]'
+)
+(
+  # The index unreadable once the commits are public: reconcile has no plan, so
+  # it names every path the split handled. The list it printed was empty.
+  # (2026-10-24.)
+  newrepo lock-unread
+  printf 'k\n' >keep && git add -A && git commit -qm base
+  printf 'a  \n' >a.txt && printf 'b\n' >b.txt && git add -A
+  w=$(instrument "$AUTO_COMMIT" update-ref 1 'cp .git/index .git/index.saved && printf garbage >.git/index')
+  fold_split "$w"
+  if [ -e .git/index.saved ]; then mv .git/index.saved .git/index; fi
+  res "L5 index unreadable after publishing: committed, every path the split handled named, no lock left" PASS eval 'fired "$w" && [ "$(commits)" = 3 ] && grep -q "^  a.txt$" "$R.out" && grep -q "^  b.txt$" "$R.out" && [ ! -e .git/index.lock ]'
 )
 (
   # Documented ambiguity: unstaging a NEW path mid-split stages exactly its
@@ -500,7 +512,8 @@ EOF
   # pathspec-guard (tests/pathspec-guard.sh) refuses staged names lefthook
   # would hand to git as patterns reaching other files. A config rendered
   # before that job existed, like cfg's, starts with auto-commit-prepare,
-  # which calls it too.
+  # which calls it too. A current render passes --no-guard, which leaves it to
+  # the guard job.
   newrepo d6 && cfg
   printf 'k\n' >keep && git add -A && LEFTHOOK=0 git commit -qm base
   printf 'c\n' >:colon.txt && printf 'n\n' >normal.txt && git add -A
@@ -509,6 +522,9 @@ EOF
   res "D6 --prepare refuses a staged path starting with ':' and names it" PASS eval '[ "$rc" = 1 ] && grep -q ":colon.txt" "$R.out"'
   git commit -qm umbrella >"$R.out" 2>&1
   res "D6 the commit is blocked before anything runs" PASS eval '[ "$(commits)" = 1 ] && [ "$(git diff --cached --name-only | wc -l)" = 2 ]'
+  "$AUTO_COMMIT" --prepare --no-guard >"$R.out" 2>&1
+  rc=$?
+  res "D6 --prepare --no-guard leaves ':colon.txt' to the guard job" PASS eval '[ "$rc" = 0 ] && ! grep -q ":colon.txt" "$R.out"'
 )
 (
   # Glob characters. After the formatter, lefthook hands the staged names to
@@ -579,4 +595,4 @@ EOF
   res "D7 1000 adds: 1000 commits, index == HEAD" PASS eval '[ "$(commits)" = 1001 ] && [ "$(idx)" = "$(headtree)" ]'
 )
 
-summary 86
+summary 88
