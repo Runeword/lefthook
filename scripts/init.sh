@@ -468,23 +468,47 @@ if [ "$root_config_existed" = false ] && [ -e lefthook.yml ]; then
   created_root_config=true
 fi
 
+# The main config lefthook loads: the first of its names present. lefthook.yml,
+# unless the repository ships one under another name, which wire-repo leaves in
+# charge rather than shadow it. Empty when the only one is a dangling symlink.
+loaded_config=""
+remaining_mains=$LEFTHOOK_MAIN_CONFIGS
+while [ "$remaining_mains" != "" ]; do
+  case $remaining_mains in
+    *' '*)
+      candidate=${remaining_mains%% *}
+      remaining_mains=${remaining_mains#* }
+      ;;
+    *)
+      candidate=$remaining_mains
+      remaining_mains=""
+      ;;
+  esac
+  if [ -e "$candidate" ]; then
+    loaded_config=$candidate
+    break
+  fi
+done
+
 git add -- lefthook-generated.yml
 if [ "$created_root_config" = true ]; then
   git add -- lefthook.yml
   wrote="lefthook-generated.yml, lefthook.yml (staged — commit them)"
-elif [ "$root_config_existed" = true ]; then
-  wrote="lefthook-generated.yml (staged — commit it); kept your existing lefthook.yml"
+elif [ "$loaded_config" != "" ]; then
+  wrote="lefthook-generated.yml (staged — commit it); kept your existing $loaded_config"
 else
   wrote="lefthook-generated.yml (staged — commit it); no lefthook.yml created (see the warning above)"
 fi
 
-# With an existing lefthook.yml kept (the --adopt path), the generated hooks run
-# only if that file extends lefthook-generated.yml. If it does not, gitleaks /
+# With an existing config kept (the --adopt path), the generated hooks run only
+# if that config extends lefthook-generated.yml. If it does not, gitleaks /
 # formatters / auto-commit are all inactive — say so loudly rather than let the
-# clean "done" below read as "everything is protected".
+# clean "done" below read as "everything is protected". The config lefthook
+# loads, not lefthook.yml: a .lefthook.yml that extended the generated file was
+# reported as not doing so.
 generated_active=true
-if [ ! -r lefthook.yml ] ||
-  ! sed 's/#.*//' lefthook.yml | grep -E '(^|[^.])lefthook-generated\.yml' >/dev/null 2>&1; then
+if [ "$loaded_config" = "" ] ||
+  ! sed 's/#.*//' "$loaded_config" | grep -E '(^|[^.])lefthook-generated\.yml' >/dev/null 2>&1; then
   generated_active=false
 fi
 
@@ -560,16 +584,7 @@ case " $missing_names " in
 esac
 
 if [ "$generated_active" = false ]; then
-  # Not always lefthook.yml: when the repository ships its main config under one
-  # of the other names lefthook loads, wire-repo leaves lefthook.yml uncreated
-  # and names that file in the warning it printed above. Naming it again here
-  # would mean repeating wire-repo's search, so point at that warning instead.
-  if [ -e lefthook.yml ]; then
-    extends_target="your lefthook.yml"
-  else
-    extends_target="the config named in the warning above"
-  fi
-  echo "lefthook-init: WARNING: $extends_target does not extend lefthook-generated.yml, so" >&2
+  echo "lefthook-init: WARNING: ${loaded_config:-the config named in the warning above} does not extend lefthook-generated.yml, so" >&2
   echo "lefthook-init: the generated hooks (gitleaks, formatters, auto-commit) are NOT active. Add:" >&2
   echo "lefthook-init:     extends:" >&2
   echo "lefthook-init:       - lefthook-generated.yml" >&2
