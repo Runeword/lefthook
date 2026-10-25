@@ -60,10 +60,14 @@ if [ "${1:-}" = "--prepare" ]; then
   # Staged names lefthook would hand to git as patterns that reach other files
   # are refused by pathspec-guard (scripts/pathspec-guard.sh), the render's
   # first job wherever a formatter stages its fix, which also keeps a copy of
-  # lefthook's backup of the unstaged changes. Configs rendered with this pass
-  # (from 2026-08-15) but before that job existed run only this pass, so it
-  # calls the guard too.
-  pathspec-guard || exit 1
+  # lefthook's backup of the unstaged changes. The render passes --no-guard,
+  # which leaves the guard to that job alone: it runs once, and turning the job
+  # off turns it off. A config rendered before the flag gets it here as well:
+  # from 2026-08-15, when this pass appeared, until that job existed, this pass
+  # was its only guard.
+  if [ "${2:-}" != --no-guard ]; then
+    pathspec-guard || exit 1
+  fi
   # Those with unstaged changes, and those git never compares, which "git diff"
   # cannot show: marked assume-unchanged or skip-worktree (lowercase or S in
   # "ls-files -v"), usually because the working-tree copy holds a local-only
@@ -193,8 +197,11 @@ entries=$split_dir/entries
 reconcile() {
   reconciled=1
   [ -s "$entries" ] || return 0
-  if reconcile_plan "$real_index" "$split_dir/stage-unlocked" 2>/dev/null &&
-    [ ! -s "$split_dir/stage-unlocked" ]; then
+  if ! reconcile_plan "$real_index" "$split_dir/stage-unlocked" 2>/dev/null; then
+    # No plan: should the read under the lock fail too, every path the split
+    # handled is named.
+    : >"$split_dir/stage-unlocked"
+  elif [ ! -s "$split_dir/stage-unlocked" ]; then
     return 0
   fi
   _tries=0
@@ -224,10 +231,19 @@ reconcile() {
   index_locked=0
 }
 
-# reconcile_failed PLAN: say which paths PLAN would have brought up to date.
+# reconcile_failed PLAN: say which paths PLAN would have brought up to date, or,
+# for an empty PLAN (none could be made), every path the split handled: any of
+# them may still be staged as before the commits. `git reset -q -- PATH` stages
+# what HEAD holds, as reconcile would have; `git add` would stage unstaged
+# changes too, and add back a file whose removal `git rm --cached` staged.
 reconcile_failed() {
-  echo "auto-commit: committed, but the index could not be brought up to date for these (git add them):" >&2
-  sed "s/^[^$tab]*$tab/  /" "$1" >&2 2>/dev/null || true
+  if [ -s "$1" ]; then
+    echo "auto-commit: committed, but the index could not be brought up to date for these (git reset -q -- them):" >&2
+    sed "s/^[^$tab]*$tab/  /" "$1" >&2 2>/dev/null || true
+  else
+    echo "auto-commit: committed, but the index could not be read to bring these up to date; any that git status still lists as staged may be staged as before the commits (git reset -q -- it):" >&2
+    sed "s/^[^$tab]*$tab/  /" "$entries" >&2 2>/dev/null || true
+  fi
 }
 
 # reconcile_plan INDEX OUT: into OUT, the --index-info lines that bring each
