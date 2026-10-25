@@ -228,24 +228,39 @@
           };
           # yamlfmt for the formatter of GUARD_CONFIG. The renders: a
           # formatter's (the guard first), one where nothing stages a fix (no
-          # guard), and a formatter's with auto-commit but no guard job, as
-          # configs rendered before the guard existed start.
-          behaviour-pathspec-guard = mkBehaviourCheck pkgs "pathspec-guard" [ pkgs.yamlfmt ] {
-            AUTO_COMMIT = bin "auto-commit";
-            PATHSPEC_GUARD = bin "pathspec-guard";
-            GUARD_CONFIG = render { hooks.format-yaml.enable = true; };
-            NO_STAGING_CONFIG = render {
-              gitleaks = true;
-              autoCommit = true;
+          # guard), a formatter's with auto-commit and the guard turned off, and
+          # that one as configs rendered before the guard existed start: no
+          # guard job, and a prepare pass without --no-guard.
+          behaviour-pathspec-guard =
+            let
+              guardOff = render {
+                lanes = [ "yaml" ];
+                autoCommit = true;
+                hooks.pathspec-guard.enable = false;
+              };
+            in
+            mkBehaviourCheck pkgs "pathspec-guard" [ pkgs.yamlfmt ] {
+              AUTO_COMMIT = bin "auto-commit";
+              PATHSPEC_GUARD = bin "pathspec-guard";
+              GUARD_CONFIG = render { hooks.format-yaml.enable = true; };
+              NO_STAGING_CONFIG = render {
+                gitleaks = true;
+                autoCommit = true;
+              };
+              GUARD_OFF_CONFIG = guardOff;
+              PREPARE_ONLY_CONFIG = pkgs.runCommand "lefthook-prepare-only.yml" { } ''
+                sed 's/ --no-guard$//' ${guardOff} >"$out"
+                if grep -q -e --no-guard "$out"; then
+                  echo "PREPARE_ONLY_CONFIG: --no-guard is still in the render" >&2
+                  exit 1
+                fi
+              '';
             };
-            PREPARE_ONLY_CONFIG = render {
-              lanes = [ "yaml" ];
-              autoCommit = true;
-              hooks.pathspec-guard.enable = false;
-            };
-          };
           behaviour-security-gitleaks = mkBehaviourCheck pkgs "security-gitleaks" [ ] {
             SECURITY_GITLEAKS = bin "security-gitleaks";
+          };
+          behaviour-wire-repo = mkBehaviourCheck pkgs "wire-repo" [ ] {
+            WIRE_REPO = bin "wire-repo";
           };
           # golangci-lint loads packages through the go command; the wrapper
           # takes it from the project's own toolchain, so supply one here. And
