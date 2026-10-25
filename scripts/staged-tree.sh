@@ -34,10 +34,11 @@
 # config's directory. lefthook SIGKILLs a job on ^C, so no trap runs then: the
 # next run of the same hook reclaims the copy (and an index.lock that a git
 # killed along with it left there), and every run deletes the copies idle for
-# an hour whose lock is free. cp keeps a directory's mode, so a read-only
-# directory of the working tree arrives read-only and nothing in it can be
-# deleted: a removal that fails makes the copy writable and tries again. (A copy
-# holding one failed that run, and every run after it.)
+# an hour whose lock is free. The copy's directories are made writable (see
+# staged_copy_in), but one that staged_carry copies whole keeps its mode, and
+# nothing in a read-only directory can be deleted: a removal that fails makes
+# the copy writable and tries again. (A copy holding one failed that run, and
+# every run after it.)
 #
 # What the copy holds, for each entry of the staged tree:
 #   - a file whose working-tree copy matches the index: the working-tree file,
@@ -205,7 +206,7 @@ enter_staged_tree() {
       checkout-index -z --stdin --prefix="$_st_copy/" <"$_st_work/from-index"
   fi
   if [ -s "$_st_work/from-worktree" ]; then
-    xargs -0 cp --parents --no-dereference --preserve=mode -t "$_st_copy" -- <"$_st_work/from-worktree"
+    staged_copy_in "$_st_work/from-worktree" "$_st_copy"
   fi
   if [ -s "$_st_work/gitlinks" ]; then
     _st_fill_submodules "$_st_work/gitlinks" "$_st_top" "$_st_copy"
@@ -299,6 +300,23 @@ _st_fill_submodules() {
       )
     done <"$_st_work/subbatch"
   done
+}
+
+# staged_copy_in LIST DEST: copy the files LIST names (NUL-separated, relative
+# to the current directory) to the same paths below DEST, in one cp batch.
+# Their directories are made first, writable: cp --parents gives a directory it
+# makes the source's mode once the first file is in, so a read-only directory
+# of the working tree took one file and refused the next, and the check
+# failed. One it finds it leaves alone, given no --preserve=mode, with which
+# cp means to give it the source's mode too. A file keeps its mode, less the
+# umask.
+staged_copy_in() {
+  LC_ALL=C awk 'BEGIN { RS = "\0" }
+    {
+      d = $0
+      if (sub(/\/[^\/]*$/, "", d) && !(d in seen)) { seen[d] = 1; printf "%s%c", d, 0 }
+    }' "$1" | (cd -- "$2" && xargs -0 -r mkdir -p --)
+  xargs -0 -r cp --parents --no-dereference -t "$2" -- <"$1"
 }
 
 # staged_carry DIR PATH: copy DIR/PATH (DIR relative to the current directory
