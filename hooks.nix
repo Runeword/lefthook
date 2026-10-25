@@ -48,10 +48,10 @@ in
   # lefthook leaves a deleted file out of {staged_files} and skips a job left
   # with none, so the first job does not run for a commit whose only Go change
   # is a deletion. The second has no file template and no glob, so lefthook
-  # runs it for every commit: it lints the packages that lost a .go file when
-  # no .go file is added or modified, and otherwise exits at once, the first
-  # job linting those packages too. No glob, because lefthook lists a renamed
-  # file by its new name only: x.go renamed to x.go.orig matched none.
+  # runs it for every commit, after the first: it lints the packages that lost
+  # a .go file, unless the first job linted them already for what is staged
+  # (scripts/lint-go.sh). No glob, because lefthook lists a renamed file by its
+  # new name only: x.go renamed to x.go.orig matched none.
   # tests/staged-tree.sh commits through this exact render.
   lint-go = {
     lane = "go";
@@ -307,11 +307,14 @@ in
     # in-hook reformat into the split commits while preserving partial
     # staging. Needed because lefthook >= 2.1.7 defers `stage_fixed` to after
     # finalize jobs, so the index the finalize job sees would otherwise still
-    # hold the pre-format blob. See scripts/auto-commit.sh.
+    # hold the pre-format blob. See scripts/auto-commit.sh. `--no-guard`:
+    # without it the pass runs pathspec-guard itself, as configs rendered
+    # before that job existed need; here the job has run already where it is
+    # on, and where it is off, the guard stays off.
     prepareJobs = [
       {
         name = "auto-commit-prepare";
-        run = "auto-commit --prepare";
+        run = "auto-commit --prepare --no-guard";
         skip = [
           "merge"
           "rebase"
