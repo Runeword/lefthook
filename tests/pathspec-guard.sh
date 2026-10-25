@@ -203,7 +203,7 @@ guardrepo() {
   newrepo "$1" && use_render "$GUARD_CONFIG"
   printf 'k: v\n' >keep.yml && git add -A && LEFTHOOK=0 git commit -qm base
 }
-PATH=${PATHSPEC_GUARD%/*}:$PATH
+PATH=${PATHSPEC_GUARD%/*}:${AUTO_COMMIT%/*}:$PATH
 (
   guardrepo r1
   printf 'a:   1\n' >a.yml && git add a.yml
@@ -272,12 +272,22 @@ PATH=${PATHSPEC_GUARD%/*}:$PATH
   # A config rendered with auto-commit's prepare pass (2026-08-15 on) but
   # before the guard job keeps the backup through that pass.
   newrepo r5 && use_render "$PREPARE_ONLY_CONFIG"
-  PATH=${AUTO_COMMIT%/*}:$PATH
   printf 'a: 1\nb: 2\n' >p.yml && git add -A && LEFTHOOK=0 git commit -qm base
   printf 'a: 10\nb: 2\n' >p.yml && git add p.yml
   printf 'a: 10\nb: 20\n' >p.yml
   git commit -qm one >"$R.out" 2>&1
   res "R5 with no guard job, auto-commit's prepare pass keeps the backup" PASS eval '! grep -q pathspec-guard lefthook-generated.yml && [ "$(git show refs/lefthook/backup:p.yml | tail -1)" = "b: 20" ] && [ "$(git log -1 --format=%s)" = "Update p.yml" ]'
 )
+(
+  # A current render passes --no-guard to that pass, leaving the guard to its
+  # own job: turned off, it no longer runs at all. The pass ran it regardless,
+  # so with auto-commit on the guard could not be turned off. (2026-10-24.)
+  newrepo r6 && use_render "$GUARD_OFF_CONFIG"
+  printf 'a: 1\nb: 2\n' >p.yml && git add -A && LEFTHOOK=0 git commit -qm base
+  printf 'a: 10\nb: 2\n' >p.yml && git add p.yml
+  printf 'a: 10\nb: 20\n' >p.yml
+  git commit -qm one >"$R.out" 2>&1
+  res "R6 the guard turned off, with auto-commit on: no guard runs, no backup is copied" PASS eval 'grep -q -e "--prepare --no-guard" lefthook-generated.yml && ! git rev-parse -q --verify refs/lefthook/backup >/dev/null && [ "$(git log -1 --format=%s)" = "Update p.yml" ]'
+)
 
-summary 43
+summary 44
