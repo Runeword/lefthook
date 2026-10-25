@@ -10,9 +10,13 @@
 # lefthook leaves deleted files out of {staged_files} and skips a job left
 # with none, so a commit whose only Go change is a deletion (or a rename to a
 # name without .go) runs this as "lint-go --deletions", from a job with no file
-# template and no glob, which lefthook runs for every commit. That run lints
-# the directories that lost a .go file, and only when no .go file is added or
-# modified: otherwise the job with the files runs and lints them as well.
+# template and no glob, which lefthook runs for every commit, after the job
+# with the files. That run lints the directories that lost a .go file, unless
+# the job with the files has done so: run from the top, that job lints them as
+# well and, once they pass, records what was staged in the git directory. A
+# record, not a guess at whether lefthook runs that job: it leaves files out
+# for other reasons too (exclude:, a staged file the working tree lacks), and a
+# deletion committed along with a .go file it left out went unlinted.
 #
 # Run golangci-lint from *inside* each directory rather than passing "./$dir"
 # from the repo root: golangci-lint needs a module context (a go.mod at or above
@@ -65,16 +69,23 @@
 # Read from the real index, before enter_staged_tree leaves the repository.
 lg_deleted=$(git diff --cached --name-only --relative --no-renames --diff-filter=D -z -- '*.go' |
   xargs -0 -r dirname --)
+# With deletions to lint, what is staged: HEAD and the index's entries. The run
+# with the files writes it to $lg_record once it has linted them (below).
+lg_key=""
+if [ -n "$lg_deleted" ]; then
+  lg_key=$({
+    git rev-parse -q --verify HEAD || true
+    git ls-files -s -z
+  } | git hash-object --stdin)
+  lg_record=$(git rev-parse --absolute-git-dir)/lefthook-lint-go-deletions
+fi
 if [ "$1" = --deletions ]; then
   # Run for every commit, Go or not: with no .go file deleted there is nothing
-  # to lint, and no go is needed.
+  # to lint, and no go is needed. Nor when the run with the files linted these
+  # deletions, for what is staged now.
   [ -n "$lg_deleted" ] || exit 0
-  # Whether lefthook runs the job with the files for this commit: its file
-  # list, ACMR from the top, through the job's glob, which lefthook matches
-  # ignoring case. A pattern still, under `git --literal-pathspecs commit`:
-  # staged-tree.sh, which comes first, unsets GIT_LITERAL_PATHSPECS.
-  lg_changed=$(git diff --cached --name-only --diff-filter=ACMR -- ':(top,icase)*.go')
-  [ -z "$lg_changed" ] || exit 0
+  [ "$(cat -- "$lg_record" 2>/dev/null || true)" != "$lg_key" ] || exit 0
+  lg_key=""
   set --
 fi
 lg_tab=$(printf '\t')
@@ -386,7 +397,7 @@ cut -d "$lg_us" -f4 "$staged_scratch/plan" | sort -u | while IFS= read -r lg_gow
   fi
 done >>"$staged_scratch/carry"
 if [ -s "$staged_scratch/carry" ]; then
-  (cd -- "$staged_worktree" && xargs -0 cp --parents --no-dereference --preserve=mode -t "$staged_copy" --) <"$staged_scratch/carry"
+  (cd -- "$staged_worktree" && staged_copy_in "$staged_scratch/carry" "$staged_copy")
   lg_n=$(tr -cd '\0' <"$staged_scratch/carry" | wc -c)
   # awk reads to the end; `| head` exits early, and under pipefail the writer it
   # leaves without a reader fails the hook.
@@ -450,4 +461,9 @@ while IFS="$lg_us" read -r lg_dir lg_wt lg_gomod lg_gowork lg_config; do
     lg_failed=1
   fi
 done <"$staged_scratch/plan"
+# For the --deletions run that follows: these deletions are linted, and pass.
+# Only from the top: from a root: directory, the run saw only those below it.
+if [ "$lg_failed" = 0 ] && [ -n "$lg_key" ] && [ -z "$staged_prefix" ]; then
+  { printf '%s\n' "$lg_key" >"$lg_record"; } 2>/dev/null || true
+fi
 exit "$lg_failed"
