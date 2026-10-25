@@ -328,6 +328,31 @@ echo "# where the copy lives"
   res "a read-only directory in the copy: the next run passes too" PASS eq "$rc2" 0
 )
 (
+  # cp --parents gives a directory it makes the source's mode once the first
+  # file is in, so a read-only directory of the working tree took one file and
+  # refused the next: the check failed, for git-ignored files carried in as
+  # for tracked ones. (2026-10-24.)
+  gorepo l12
+  printf 'gen/\n' >.gitignore
+  mkdir -p ro gen
+  printf 'package ro\n\nfunc R() int { return s() }\n' >ro/r.go
+  printf 'package ro\n\nfunc s() int { return 1 }\n' >ro/s.go
+  printf 'package gen\n\nfunc G() int { return g() }\n' >gen/g.go
+  printf 'package gen\n\nfunc g() int { return 2 }\n' >gen/h.go
+  printf 'package main\n\nimport (\n\t"example.com/m/gen"\n\t"example.com/m/ro"\n)\n\nfunc main() { _ = ro.R() + gen.G() }\n' >main.go
+  git add -A && git commit -qm ro
+  printf 'package main\n\nimport (\n\t"example.com/m/gen"\n\t"example.com/m/ro"\n)\n\nfunc main() { _ = ro.R() + gen.G() + 1 }\n' >main.go && git add main.go
+  chmod 555 gen
+  lint main.go
+  rc=$?
+  res "a read-only git-ignored directory: both of its files are carried in" PASS eval '[ "$rc" = 0 ] && grep -q "using 2 untracked" "$R.out"'
+  chmod 755 gen && chmod 555 ro
+  lint main.go
+  rc=$?
+  chmod 755 ro
+  res "a read-only directory of two tracked files: the check passes, and the copy is removed" PASS eval '[ "$rc" = 0 ] && [ "$(leftover_trees)" = 0 ]'
+)
+(
   # What a run lefthook killed leaves behind: a copy with a read-only
   # directory, and the index.lock of the git killed with it, on which every
   # later run failed with exit 128. (Round-11 review.)
@@ -743,6 +768,22 @@ echo "# tflint"
   rc=$?
   res "... and the directories after it are linted too" PASS eval '[ "$rc" != 0 ] && grep -q AlsoBad "$R.out"'
 )
+(
+  # A read-only module directory of two files: the copy of the second was
+  # refused, and the check failed. The rewrite of the copy's .tflint.hcl
+  # needs that directory writable too. (2026-10-24.)
+  newrepo t4
+  mkdir -p ro
+  printf 'resource "null_resource" "a" {}\n' >ro/main.tf
+  printf 'config {\n  plugin_dir = "./my-plugins"\n}\nrule "terraform_required_version" {\n  enabled = false\n}\nrule "terraform_required_providers" {\n  enabled = false\n}\n' >ro/.tflint.hcl
+  mkdir -p ro/my-plugins
+  git add -A && git commit -qm ro
+  chmod 555 ro
+  TFLINT_LOG=debug "$LINT_OPENTOFU" ro/main.tf >"$R.out" 2>&1
+  rc=$?
+  chmod 755 ro
+  res "a read-only module directory is linted with its .tflint.hcl rewritten" PASS eval '[ "$rc" = 0 ] && grep -q "PluginDir: $R/ro/./my-plugins" "$R.out"'
+)
 
 echo "# trivy"
 (
@@ -811,11 +852,25 @@ echo "# the rendered lint-go jobs"
   git commit -qm 'rename helper away' >"$R.out" 2>&1
   rc=$?
   res "a commit that only renames a .go file to a name without .go is linted" PASS eval '[ "$rc" != 0 ] && grep -q "undefined: helper" "$R.out"'
+  # lefthook leaves out of {staged_files} a staged file the working tree lacks,
+  # and skips lint-go when no file is left. lint-go-deletions took the staged
+  # .go file for a sign that lint-go would run, and the deletion committed
+  # along with it went unlinted. (2026-10-24.)
+  gorepo h4
+  printf 'package main\n\nfunc helper() {}\n' >helper.go
+  printf 'package main\n\nfunc main() { helper() }\n' >main.go
+  git add -A && git commit -qm helper
+  use_render "$LINT_GO_CONFIG"
+  git rm -q helper.go
+  printf 'package main\n\nvar Extra = 1\n' >extra.go && git add extra.go && rm extra.go
+  git commit -qm 'delete helper, add extra' >"$R.out" 2>&1
+  rc=$?
+  res "a .go deletion is linted when lefthook leaves lint-go no file" PASS eval '[ "$rc" != 0 ] && grep -q "undefined: helper" "$R.out"'
 )
 (
   # lint-go-deletions runs for every commit. It lints nothing for one with no
-  # Go change, so it needs no go then, and leaves a deletion to lint-go's own
-  # job when a .go file is added or modified too.
+  # Go change, so it needs no go then, and lints a deletion whatever else is
+  # staged.
   gorepo h2
   mkdir -p lib
   printf 'package lib\n\nfunc helper() {}\n' >lib/a.go
@@ -829,10 +884,37 @@ echo "# the rendered lint-go jobs"
   printf 'package main\n\nfunc main() { _ = 2 }\n' >main.go && git add main.go
   lint --deletions
   rc=$?
-  res "lint-go --deletions leaves a deletion to lint-go when a .go file changes too" PASS eval '[ "$rc" = 0 ] && ! grep -q "undefined: helper" "$R.out"'
+  res "lint-go --deletions lints a deletion when a .go file changes too" PASS eval '[ "$rc" != 0 ] && grep -q "undefined: helper" "$R.out"'
   lint main.go
   rc=$?
-  res "... which lints the package that lost the file" PASS eval '[ "$rc" != 0 ] && grep -q "undefined: helper" "$R.out"'
+  res "... and so does lint-go, for the package that lost the file" PASS eval '[ "$rc" != 0 ] && grep -q "undefined: helper" "$R.out"'
+)
+(
+  # Run from the top, lint-go lints the packages that lost a .go file too, and
+  # records what was staged once they pass: lint-go-deletions, which runs next,
+  # then lints nothing, and needs no go. From a root: directory lint-go sees
+  # only the deletions below it, and records nothing.
+  gorepo h3
+  mkdir -p lib
+  printf 'package lib\n\nfunc A() int { return 1 }\n' >lib/a.go
+  printf 'package lib\n\nfunc B() int { return 2 }\n' >lib/b.go
+  git add -A && git commit -qm lib
+  git rm -q lib/a.go
+  printf 'package lib\n\nfunc B() int { return 3 }\n' >lib/b.go && git add lib/b.go
+  (cd lib && GIT_INDEX_FILE=.git/index lint ./b.go)
+  rc1=$?
+  PATH=/nonexistent lint --deletions
+  rc2=$?
+  res "lint-go from a root: directory does not spare lint-go-deletions" PASS eval '[ "$rc1" = 0 ] && [ "$rc2" != 0 ] && grep -q "go is not on PATH" "$R.out"'
+  lint lib/b.go
+  rc1=$?
+  PATH=/nonexistent lint --deletions
+  rc2=$?
+  res "lint-go from the top, passing, spares lint-go-deletions, which needs no go then" PASS eval '[ "$rc1" = 0 ] && [ "$rc2" = 0 ]'
+  printf 'package lib\n\nfunc B() int { return 4 }\n' >lib/b.go && git add lib/b.go
+  PATH=/nonexistent lint --deletions
+  rc=$?
+  res "... only while what it linted is what is staged" PASS eval '[ "$rc" != 0 ] && grep -q "go is not on PATH" "$R.out"'
 )
 
 echo "# commits made with git --literal-pathspecs"
@@ -876,4 +958,4 @@ echo "# cost"
   echo "   c1 warm lint-go with 5003 tracked files: ${t1}ms"
 )
 
-summary 82
+summary 89
