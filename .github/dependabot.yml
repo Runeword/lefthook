@@ -1,0 +1,10 @@
+version: 2
+updates:
+  - package-ecosystem: "nix"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    # A revision is proposed once it is a week old: long enough for a
+    # compromised or broken upstream commit to be noticed and reverted first.
+    cooldown:
+      default-days: 7
