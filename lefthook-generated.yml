@@ -5,7 +5,7 @@ pre-commit:
     - name: pathspec-guard
       run: pathspec-guard
     - name: auto-commit-prepare
-      run: auto-commit --prepare
+      run: auto-commit --prepare --no-guard
       skip:
         - merge
         - rebase
