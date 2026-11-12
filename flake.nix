@@ -4,10 +4,10 @@
   outputs =
     { self, nixpkgs, ... }:
     let
+      # nixpkgs-unstable no longer evaluates for x86_64-darwin.
       systems = [
         "x86_64-linux"
         "aarch64-linux"
-        "x86_64-darwin"
         "aarch64-darwin"
       ];
       forAllSystems =
