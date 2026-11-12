@@ -531,6 +531,49 @@ would exit 1 even when everything passed.
 without having looked at anything there. Scan the commits the change brings
 in with gitleaks itself, e.g. `gitleaks git --log-opts="origin/main..HEAD"`.
 
+This repository runs its flake checks on GitHub with the workflow below
+(`.github/workflows/ci.yml`). A repository that uses the flake input, and whose
+inputs are public, can copy it as is: it then runs that repository's
+`lefthook-config`, `lefthook-hooks` and other checks, at the versions its own
+`flake.lock` pins. Branch protection can require it by its job name, `check`.
+
+```yaml
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31
+      - run: nix flake check -L --keep-going
+      - if: ${{ !cancelled() }}
+        run: nix flake check --no-build --all-systems
+```
+
+`nix flake check` builds the checks of the runner's own system and skips the
+other systems without failing. The second step evaluates them all, so an input
+update that breaks another platform fails here rather than on that platform;
+it runs even when the first step failed, so one run reports both.
+
+A required check has to run on every pull request: a path filter that skips it
+leaves it pending, and nothing can merge. The job uses no secrets, so a
+Dependabot pull request is tested exactly like yours. A pull request runs its
+own copy of this workflow and of `flake.lock`, though, so read changes to
+either before you merge. The actions are pinned by commit; Dependabot's
+`github-actions` ecosystem keeps the pins current.
+
 ### `minVersion`
 
 `min_version` has to describe a lefthook that will **run** the hooks, not the one
